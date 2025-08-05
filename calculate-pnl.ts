@@ -1,6 +1,6 @@
-import { createPublicClient, http, parseAbiItem, isAddress, parseAbi } from 'viem';
+import { createPublicClient, http, parseAbiItem, isAddress, parseAbi, type PublicClient, type Log } from 'viem';
 import dotenv from 'dotenv';
-import { writeFileSync } from 'fs';
+import { writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { VaultEvent, VaultInfo, UserPosition, PnLResult, JsonExport } from './types';
 import { katanaChain } from './chain';
@@ -18,11 +18,6 @@ import {
 const args = process.argv.slice(2);
 const isJsonExport = args.includes('--json');
 
-const createClient = () => createPublicClient({
-  chain: katanaChain,
-  transport: http(KATANA_RPC),
-});
-
 if (isJsonExport) {
   dotenv.config({ quiet: true } as any);
 } else {
@@ -37,6 +32,11 @@ if (!KATANA_RPC) {
   process.exit(1);
 }
 
+const createClient = () => createPublicClient({
+  chain: katanaChain,
+  transport: http(KATANA_RPC),
+});
+
 const sortEventsByBlock = (events: VaultEvent[]): VaultEvent[] =>
   [...events].sort((a, b) => Number(a.blockNumber) - Number(b.blockNumber));
 
@@ -48,10 +48,6 @@ const calculatePnL = (
 ): PnLResult => {
   const netInvested = position.totalAssetsInvested - position.totalAssetsWithdrawn;
   const totalValue = currentValue + position.totalAssetsWithdrawn;
-  const pnl = totalValue - position.totalAssetsInvested;
-  const pnlPercentage = position.totalAssetsInvested > 0n
-    ? (exactToSimple(pnl, assetDecimals) / exactToSimple(position.totalAssetsInvested, assetDecimals)) * 100
-    : 0;
 
   const avgDepositPrice = position.totalSharesDeposited > 0n
     ? exactToSimple(position.totalAssetsInvested, assetDecimals) / exactToSimple(position.totalSharesDeposited, vaultDecimals)
@@ -66,6 +62,13 @@ const calculatePnL = (
     ? position.totalAssetsInvested * position.totalSharesHeld / position.totalSharesDeposited
     : 0n;
   const unrealizedPnL = currentValue - costBasisOfRemainingShares;
+  
+  // totalPnL should be the sum of realized and unrealized
+  const calculatedPnl = realizedPnL + unrealizedPnL;
+  
+  const pnlPercentage = position.totalAssetsInvested > 0n
+    ? (exactToSimple(calculatedPnl, assetDecimals) / exactToSimple(position.totalAssetsInvested, assetDecimals)) * 100
+    : 0;
 
   return {
     user: position.user,
@@ -75,7 +78,7 @@ const calculatePnL = (
     currentShares: position.totalSharesHeld,
     currentValue,
     totalValue,
-    pnl,
+    pnl: calculatedPnl,
     pnlPercentage,
     realizedPnL,
     unrealizedPnL,
@@ -121,7 +124,7 @@ const aggregateUserPositions = (events: VaultEvent[]): Record<string, UserPositi
 };
 
 
-const fetchVaultInfo = async (client: any, vaultAddress: string): Promise<VaultInfo> => {
+const fetchVaultInfo = async (client: PublicClient, vaultAddress: string): Promise<VaultInfo> => {
   const erc4626Abi = parseAbi([
     'function decimals() view returns (uint8)',
     'function asset() view returns (address)',
@@ -162,7 +165,7 @@ const fetchVaultInfo = async (client: any, vaultAddress: string): Promise<VaultI
 };
 
 const fetchVaultEvents = async (
-  client: any,
+  client: PublicClient,
   vaultAddress: string,
   userAddress?: string
 ): Promise<VaultEvent[]> => {
@@ -230,7 +233,7 @@ const fetchVaultEvents = async (
     const transferEvents = relevantTransfers.map(log => {
       const isIncoming = log.args.to!.toLowerCase() === userLower;
       return {
-        type: (isIncoming ? 'transfer_in' : 'transfer_out') as const,
+        type: isIncoming ? ('transfer_in' as const) : ('transfer_out' as const),
         blockNumber: log.blockNumber!,
         transactionHash: log.transactionHash,
         user: userLower,
@@ -255,36 +258,37 @@ const fetchVaultEvents = async (
              from !== to;
     });
 
-    const transferInEvents = userTransfers.map(log => ({
-      type: 'transfer_in' as const,
-      blockNumber: log.blockNumber!,
-      transactionHash: log.transactionHash,
-      user: log.args.to!,
-      assets: 0n,
-      shares: log.args.value!,
-      from: log.args.from!,
-      to: log.args.to!,
-    }));
+    const transferEvents = userTransfers.flatMap(log => [
+      {
+        type: 'transfer_in' as const,
+        blockNumber: log.blockNumber!,
+        transactionHash: log.transactionHash,
+        user: log.args.to!,
+        assets: 0n,
+        shares: log.args.value!,
+        from: log.args.from!,
+        to: log.args.to!,
+      },
+      {
+        type: 'transfer_out' as const,
+        blockNumber: log.blockNumber!,
+        transactionHash: log.transactionHash,
+        user: log.args.from!,
+        assets: 0n,
+        shares: log.args.value!,
+        from: log.args.from!,
+        to: log.args.to!,
+      }
+    ]);
 
-    const transferOutEvents = userTransfers.map(log => ({
-      type: 'transfer_out' as const,
-      blockNumber: log.blockNumber!,
-      transactionHash: log.transactionHash,
-      user: log.args.from!,
-      assets: 0n,
-      shares: log.args.value!,
-      from: log.args.from!,
-      to: log.args.to!,
-    }));
-
-    events.push(...transferInEvents, ...transferOutEvents);
+    events.push(...transferEvents);
   }
 
   return sortEventsByBlock(events);
 };
 
 const enrichEventsWithPricePerShare = async (
-  client: any,
+  client: PublicClient,
   vaultAddress: string,
   vaultDecimals: number,
   events: VaultEvent[]
@@ -358,7 +362,7 @@ const enrichEventsWithPricePerShare = async (
 };
 
 const getCurrentShareValues = async (
-  client: any,
+  client: PublicClient,
   vaultAddress: string,
   positions: Record<string, UserPosition>
 ): Promise<Record<string, bigint>> => {
@@ -522,10 +526,15 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
   }
 
   if (exportJson) {
+    const dataDir = 'data';
+    if (!existsSync(dataDir)) {
+      mkdirSync(dataDir);
+    }
+    
     const filename = userAddress
       ? `${userAddress.toLowerCase()}-${vaultAddress.toLowerCase()}.json`
       : `${vaultAddress.toLowerCase()}.json`;
-    const filepath = join('data', filename);
+    const filepath = join(dataDir, filename);
 
     writeFileSync(filepath, JSON.stringify(jsonExport, null, 2));
     console.log(`Results saved to: ${filepath}`);
