@@ -1,37 +1,57 @@
-# Katana Vault Log Fetcher
+# Yearn Vault PnL Calculator
 
-A TypeScript script to fetch Deposit event logs from ERC4626 vaults on the Katana network using viem.
+Calculate profit and loss (PnL) for ERC-4626 vault deposits and withdrawals on the Katana network.
 
-## Setup
 
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
+## Configuration
 
-2. Create a `.env` file by copying `.env.example`:
-   ```bash
-   cp .env.example .env
-   ```
+Create a `.env` file with your RPC URL:
 
-3. Update the `KATANA_RPC_URL` in your `.env` file with your RPC endpoint.
+```env
+KATANA_RPC_URL=https://your-rpc-url-here
+```
 
 ## Usage
 
-### Fetch logs from the default vault:
+### Single User PnL
+
+Calculate PnL for a specific user in a vault:
+
 ```bash
-npm run fetch-logs
+bun run calculate-pnl <vault-address> <user-address>
+
+# Example
+bun run calculate-pnl 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37 0x2086a811182F83a023c4dA3dD9d2E5539B2d43C9
 ```
 
-### Fetch logs from a custom vault address:
+### Vault-Wide PnL
+
+Calculate PnL for all users in a vault:
+
 ```bash
-npm run fetch-logs -- 0xYourVaultAddress
+bun run calculate-pnl <vault-address>
+
+# Example
+bun run calculate-pnl 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37
 ```
 
-## Environment Variables
+### JSON Export
 
-- `KATANA_RPC_URL`: The RPC endpoint for the Katana network (required)
+Add the `--json` flag to export results as JSON:
 
-## Default Vault
+```bash
+# Single user
+bun run calculate-pnl <vault-address> <user-address> --json
 
-The default vault address is: `0xE007CA01894c863d7898045ed5A3B4Abf0b18f37`
+# All users
+bun run calculate-pnl <vault-address> --json
+```
+
+JSON files are saved to the `data/` directory with descriptive names:
+- Single user: `<user-address>-<vault-address>.json`
+- All users: `<vault-address>.json`
+
+
+## License
+
+MIT
