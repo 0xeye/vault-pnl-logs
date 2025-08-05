@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "fetch-logs": "tsx fetch-logs.ts",
+    "fetch-logs": "bun run fetch-logs.ts",
+    "calculate-pnl": "bun run calculate-pnl.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
