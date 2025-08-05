@@ -2,6 +2,10 @@
 
 Calculate profit and loss (PnL) for ERC-4626 vault deposits and withdrawals on the Katana network.
 
+## Overview
+
+Analyzes ERC-4626 vault transactions to calculate user profit/loss by reading deposit, withdraw, and transfer events. Handles shares acquired through migration phase (transfer). Computes realized and unrealized gains using historical prices. Supports individual user or vault-wide analysis with JSON export.
+
 
 ## Configuration
 

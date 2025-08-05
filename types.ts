@@ -1,11 +1,13 @@
 export interface VaultEvent {
-  type: 'deposit' | 'withdraw';
+  type: 'deposit' | 'withdraw' | 'transfer_in' | 'transfer_out';
   blockNumber: bigint;
   transactionHash: string;
   user: string;
   assets: bigint;
   shares: bigint;
   pricePerShare?: bigint;
+  from?: string;
+  to?: string;
 }
 
 export interface VaultInfo {

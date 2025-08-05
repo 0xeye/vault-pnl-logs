@@ -4,18 +4,24 @@ import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { VaultEvent, VaultInfo, UserPosition, PnLResult, JsonExport } from './types';
 import { katanaChain } from './chain';
-import { 
-  formatPnLResult, 
-  formatEventForJson, 
-  formatPnLForJson, 
-  formatSummaryForJson, 
+import {
+  formatPnLResult,
+  formatEventForJson,
+  formatPnLForJson,
+  formatSummaryForJson,
   formatEventForConsole,
   formatVaultSummaryForConsole,
-  formatTopMoversForConsole
+  formatTopMoversForConsole,
+  exactToSimple
 } from './helper';
 
 const args = process.argv.slice(2);
 const isJsonExport = args.includes('--json');
+
+const createClient = () => createPublicClient({
+  chain: katanaChain,
+  transport: http(KATANA_RPC),
+});
 
 if (isJsonExport) {
   dotenv.config({ quiet: true } as any);
@@ -36,26 +42,28 @@ const sortEventsByBlock = (events: VaultEvent[]): VaultEvent[] =>
 
 const calculatePnL = (
   position: UserPosition,
-  currentValue: bigint
+  currentValue: bigint,
+  assetDecimals: number,
+  vaultDecimals: number
 ): PnLResult => {
   const netInvested = position.totalAssetsInvested - position.totalAssetsWithdrawn;
   const totalValue = currentValue + position.totalAssetsWithdrawn;
   const pnl = totalValue - position.totalAssetsInvested;
-  const pnlPercentage = position.totalAssetsInvested > 0n 
-    ? (Number(pnl) / Number(position.totalAssetsInvested)) * 100 
+  const pnlPercentage = position.totalAssetsInvested > 0n
+    ? (exactToSimple(pnl, assetDecimals) / exactToSimple(position.totalAssetsInvested, assetDecimals)) * 100
     : 0;
 
   const avgDepositPrice = position.totalSharesDeposited > 0n
-    ? Number(position.totalAssetsInvested) / Number(position.totalSharesDeposited)
+    ? exactToSimple(position.totalAssetsInvested, assetDecimals) / exactToSimple(position.totalSharesDeposited, vaultDecimals)
     : 0;
 
-  const costBasisOfWithdrawnShares = position.totalSharesWithdrawn > 0n && avgDepositPrice > 0
-    ? BigInt(Math.round(Number(position.totalSharesWithdrawn) * avgDepositPrice))
+  const costBasisOfWithdrawnShares = position.totalSharesWithdrawn > 0n && position.totalSharesDeposited > 0n
+    ? position.totalAssetsInvested * position.totalSharesWithdrawn / position.totalSharesDeposited
     : 0n;
   const realizedPnL = position.totalAssetsWithdrawn - costBasisOfWithdrawnShares;
 
-  const costBasisOfRemainingShares = position.totalSharesHeld > 0n && avgDepositPrice > 0
-    ? BigInt(Math.round(Number(position.totalSharesHeld) * avgDepositPrice))
+  const costBasisOfRemainingShares = position.totalSharesHeld > 0n && position.totalSharesDeposited > 0n
+    ? position.totalAssetsInvested * position.totalSharesHeld / position.totalSharesDeposited
     : 0n;
   const unrealizedPnL = currentValue - costBasisOfRemainingShares;
 
@@ -79,43 +87,39 @@ const aggregateUserPositions = (events: VaultEvent[]): Record<string, UserPositi
   return events.reduce((positions, event) => {
     const user = event.user.toLowerCase();
     const existingPosition = positions[user];
-    
+
     const updatedPosition: UserPosition = existingPosition ? {
       ...existingPosition,
       events: [...existingPosition.events, event],
-      totalSharesHeld: event.type === 'deposit' 
+      totalSharesHeld: event.type === 'deposit' || event.type === 'transfer_in'
         ? existingPosition.totalSharesHeld + event.shares
         : existingPosition.totalSharesHeld - event.shares,
-      totalAssetsInvested: event.type === 'deposit'
+      totalAssetsInvested: event.type === 'deposit' || event.type === 'transfer_in'
         ? existingPosition.totalAssetsInvested + event.assets
         : existingPosition.totalAssetsInvested,
-      totalAssetsWithdrawn: event.type === 'withdraw'
+      totalAssetsWithdrawn: event.type === 'withdraw' || event.type === 'transfer_out'
         ? existingPosition.totalAssetsWithdrawn + event.assets
         : existingPosition.totalAssetsWithdrawn,
-      totalSharesDeposited: event.type === 'deposit'
+      totalSharesDeposited: event.type === 'deposit' || event.type === 'transfer_in'
         ? existingPosition.totalSharesDeposited + event.shares
         : existingPosition.totalSharesDeposited,
-      totalSharesWithdrawn: event.type === 'withdraw'
+      totalSharesWithdrawn: event.type === 'withdraw' || event.type === 'transfer_out'
         ? existingPosition.totalSharesWithdrawn + event.shares
         : existingPosition.totalSharesWithdrawn,
     } : {
       user,
       events: [event],
-      totalSharesHeld: event.type === 'deposit' ? event.shares : -event.shares,
-      totalAssetsInvested: event.type === 'deposit' ? event.assets : 0n,
-      totalAssetsWithdrawn: event.type === 'withdraw' ? event.assets : 0n,
-      totalSharesDeposited: event.type === 'deposit' ? event.shares : 0n,
-      totalSharesWithdrawn: event.type === 'withdraw' ? event.shares : 0n,
+      totalSharesHeld: event.type === 'deposit' || event.type === 'transfer_in' ? event.shares : -event.shares,
+      totalAssetsInvested: event.type === 'deposit' || event.type === 'transfer_in' ? event.assets : 0n,
+      totalAssetsWithdrawn: event.type === 'withdraw' || event.type === 'transfer_out' ? event.assets : 0n,
+      totalSharesDeposited: event.type === 'deposit' || event.type === 'transfer_in' ? event.shares : 0n,
+      totalSharesWithdrawn: event.type === 'withdraw' || event.type === 'transfer_out' ? event.shares : 0n,
     };
 
     return { ...positions, [user]: updatedPosition };
   }, {} as Record<string, UserPosition>);
 };
 
-const createClient = () => createPublicClient({
-  chain: katanaChain,
-  transport: http(KATANA_RPC),
-});
 
 const fetchVaultInfo = async (client: any, vaultAddress: string): Promise<VaultInfo> => {
   const erc4626Abi = parseAbi([
@@ -164,11 +168,12 @@ const fetchVaultEvents = async (
 ): Promise<VaultEvent[]> => {
   const depositEventAbi = parseAbiItem('event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)');
   const withdrawEventAbi = parseAbiItem('event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)');
+  const transferEventAbi = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)');
 
   const depositArgs = userAddress ? { owner: userAddress as `0x${string}` } : undefined;
   const withdrawArgs = userAddress ? { owner: userAddress as `0x${string}` } : undefined;
 
-  const [depositLogs, withdrawLogs] = await Promise.all([
+  const [depositLogs, withdrawLogs, transferLogs] = await Promise.all([
     client.getLogs({
       address: vaultAddress as `0x${string}`,
       event: depositEventAbi,
@@ -182,6 +187,12 @@ const fetchVaultEvents = async (
       fromBlock: 'earliest',
       toBlock: 'latest',
       args: withdrawArgs,
+    }),
+    client.getLogs({
+      address: vaultAddress as `0x${string}`,
+      event: transferEventAbi,
+      fromBlock: 'earliest',
+      toBlock: 'latest',
     }),
   ]);
 
@@ -204,6 +215,71 @@ const fetchVaultEvents = async (
     })),
   ];
 
+  if (userAddress) {
+    const userLower = userAddress.toLowerCase();
+    const zeroAddress = '0x0000000000000000000000000000000000000000';
+    
+    const relevantTransfers = transferLogs.filter(log => {
+      const from = log.args.from!.toLowerCase();
+      const to = log.args.to!.toLowerCase();
+      
+      return (to === userLower && from !== zeroAddress && from !== userLower) ||
+             (from === userLower && to !== zeroAddress && to !== userLower);
+    });
+
+    const transferEvents = relevantTransfers.map(log => {
+      const isIncoming = log.args.to!.toLowerCase() === userLower;
+      return {
+        type: (isIncoming ? 'transfer_in' : 'transfer_out') as const,
+        blockNumber: log.blockNumber!,
+        transactionHash: log.transactionHash,
+        user: userLower,
+        assets: 0n,
+        shares: log.args.value!,
+        from: log.args.from!,
+        to: log.args.to!,
+      };
+    });
+
+    events.push(...transferEvents);
+  } else {
+    const zeroAddress = '0x0000000000000000000000000000000000000000';
+    const vaultLower = vaultAddress.toLowerCase();
+    
+    const userTransfers = transferLogs.filter(log => {
+      const from = log.args.from!.toLowerCase();
+      const to = log.args.to!.toLowerCase();
+      
+      return from !== zeroAddress && to !== zeroAddress && 
+             from !== vaultLower && to !== vaultLower &&
+             from !== to;
+    });
+
+    const transferInEvents = userTransfers.map(log => ({
+      type: 'transfer_in' as const,
+      blockNumber: log.blockNumber!,
+      transactionHash: log.transactionHash,
+      user: log.args.to!,
+      assets: 0n,
+      shares: log.args.value!,
+      from: log.args.from!,
+      to: log.args.to!,
+    }));
+
+    const transferOutEvents = userTransfers.map(log => ({
+      type: 'transfer_out' as const,
+      blockNumber: log.blockNumber!,
+      transactionHash: log.transactionHash,
+      user: log.args.from!,
+      assets: 0n,
+      shares: log.args.value!,
+      from: log.args.from!,
+      to: log.args.to!,
+    }));
+
+    events.push(...transferInEvents, ...transferOutEvents);
+  }
+
   return sortEventsByBlock(events);
 };
 
@@ -213,29 +289,72 @@ const enrichEventsWithPricePerShare = async (
   vaultDecimals: number,
   events: VaultEvent[]
 ): Promise<VaultEvent[]> => {
+  const oneShare = 10n ** BigInt(vaultDecimals);
   const erc4626Abi = parseAbi([
     'function convertToAssets(uint256 shares) view returns (uint256)',
   ]);
 
-  const oneShare = 10n ** BigInt(vaultDecimals);
+  const transferEvents = events.filter(e => e.type === 'transfer_in' || e.type === 'transfer_out');
+  const uniqueTransferBlocks = [...new Set(transferEvents.map(e => e.blockNumber))];
+  const blockPriceMap: Record<string, bigint> = {};
+  
+  if (uniqueTransferBlocks.length > 0) {
+    const BATCH_SIZE = 20;
+    for (let i = 0; i < uniqueTransferBlocks.length; i += BATCH_SIZE) {
+      const blockBatch = uniqueTransferBlocks.slice(i, i + BATCH_SIZE);
+      
+      const results = await Promise.all(
+        blockBatch.map(async (blockNumber) => {
+          const contracts = [{
+            address: vaultAddress as `0x${string}`,
+            abi: erc4626Abi,
+            functionName: 'convertToAssets',
+            args: [oneShare],
+          }];
 
-  const contracts = events.map(event => ({
-    address: vaultAddress as `0x${string}`,
-    abi: erc4626Abi,
-    functionName: 'convertToAssets',
-    args: [oneShare],
-    blockNumber: event.blockNumber,
-  }));
+          const result = await client.multicall({
+            contracts,
+            blockNumber,
+            allowFailure: false,
+          });
 
-  const results = await client.multicall({
-    contracts,
-    allowFailure: false,
+          return { blockNumber, pricePerShare: result[0] };
+        })
+      );
+      
+      results.forEach(({ blockNumber, pricePerShare }) => {
+        blockPriceMap[blockNumber.toString()] = pricePerShare;
+      });
+      
+      if (i + BATCH_SIZE < uniqueTransferBlocks.length) {
+        console.log(`Fetched prices for ${i + BATCH_SIZE} of ${uniqueTransferBlocks.length} transfer blocks...`);
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+  }
+
+  return events.map(event => {
+    if (event.type === 'deposit' || event.type === 'withdraw') {
+      const pricePerShare = (event.assets * oneShare) / event.shares;
+      return {
+        ...event,
+        pricePerShare,
+      };
+    }
+    
+    if (event.type === 'transfer_in' || event.type === 'transfer_out') {
+      const pricePerShare = blockPriceMap[event.blockNumber.toString()];
+      const assets = (event.shares * pricePerShare) / oneShare;
+      
+      return {
+        ...event,
+        assets,
+        pricePerShare,
+      };
+    }
+    
+    return event;
   });
-
-  return events.map((event, index) => ({
-    ...event,
-    pricePerShare: results[index],
-  }));
 };
 
 const getCurrentShareValues = async (
@@ -250,7 +369,7 @@ const getCurrentShareValues = async (
   const positionEntries = Object.entries(positions);
   const positionsWithShares = positionEntries.filter(([_, position]) => position.totalSharesHeld > 0n);
   const positionsWithoutShares = positionEntries.filter(([_, position]) => position.totalSharesHeld <= 0n);
-  
+
   const initialValues = positionsWithoutShares.reduce(
     (acc, [user]) => ({ ...acc, [user]: 0n }),
     {} as Record<string, bigint>
@@ -286,7 +405,7 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
   }
 
   const client = createClient();
-  
+
   if (!exportJson) {
     console.log('Calculating PnL for:', userAddress || 'All vault users');
     console.log('Vault:', vaultAddress);
@@ -309,12 +428,12 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
   );
 
   const positions = aggregateUserPositions(enrichedEvents);
-  
+
   const currentValues = await getCurrentShareValues(client, vaultAddress, positions);
 
   const results: PnLResult[] = Object.entries(positions).map(([user, position]) => {
     const currentValue = currentValues[user] || 0n;
-    return calculatePnL(position, currentValue);
+    return calculatePnL(position, currentValue, vaultInfo.assetDecimals, vaultInfo.decimals);
   });
 
   const jsonExport: JsonExport = {
@@ -330,13 +449,18 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
   if (userAddress) {
     const position = positions[userAddress.toLowerCase()];
     if (position && !exportJson) {
-      console.log(`Found ${position.events.filter(e => e.type === 'deposit').length} deposits and ${position.events.filter(e => e.type === 'withdraw').length} withdrawals\n`);
+      const deposits = position.events.filter(e => e.type === 'deposit').length;
+      const withdrawals = position.events.filter(e => e.type === 'withdraw').length;
+      const transfersIn = position.events.filter(e => e.type === 'transfer_in').length;
+      const transfersOut = position.events.filter(e => e.type === 'transfer_out').length;
       
-      position.events.map((event, index) => 
+      console.log(`Found ${deposits} deposits, ${withdrawals} withdrawals, ${transfersIn} transfers in, ${transfersOut} transfers out\n`);
+
+      position.events.map((event, index) =>
         console.log(formatEventForConsole(event, index, vaultInfo))
       );
     }
-    
+
     if (position && exportJson) {
       jsonExport.events = position.events.map(event => formatEventForJson(event, vaultInfo));
     }
@@ -345,7 +469,7 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
   if (!exportJson) {
     console.log('\n=== PnL Summary ===');
   }
-  
+
   if (results.length === 1) {
     const result = results[0];
     if (!exportJson) {
@@ -381,14 +505,14 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
     const totalNetInvested = totals.totalDeposited - totals.totalWithdrawn;
     const totalCurrentValue = Object.values(currentValues).reduce((sum, val) => sum + val, 0n);
     const totalValue = totalCurrentValue + totals.totalWithdrawn;
-    const totalPnlPercentage = totals.totalDeposited > 0n 
-      ? (Number(totals.pnl) / Number(totals.totalDeposited)) * 100 
+    const totalPnlPercentage = totals.totalDeposited > 0n
+      ? (exactToSimple(totals.pnl, vaultInfo.assetDecimals) / exactToSimple(totals.totalDeposited, vaultInfo.assetDecimals)) * 100
       : 0;
 
     if (!exportJson) {
       console.log(formatVaultSummaryForConsole(results, totals, totalNetInvested, totalCurrentValue, totalValue, totalPnlPercentage, vaultInfo));
-      
-      const sortedByPnl = [...results].sort((a, b) => Number(b.pnl) - Number(a.pnl));
+
+      const sortedByPnl = [...results].sort((a, b) => exactToSimple(b.pnl, vaultInfo.assetDecimals) - exactToSimple(a.pnl, vaultInfo.assetDecimals));
       console.log(formatTopMoversForConsole('Top 5 Gainers', sortedByPnl.slice(0, 5), vaultInfo));
       console.log(formatTopMoversForConsole('Top 5 Losers', sortedByPnl.slice(-5).reverse(), vaultInfo));
     } else {
@@ -396,13 +520,13 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
       jsonExport.users = results.map(result => formatPnLForJson(result, vaultInfo));
     }
   }
-  
+
   if (exportJson) {
-    const filename = userAddress 
+    const filename = userAddress
       ? `${userAddress.toLowerCase()}-${vaultAddress.toLowerCase()}.json`
       : `${vaultAddress.toLowerCase()}.json`;
     const filepath = join('data', filename);
-    
+
     writeFileSync(filepath, JSON.stringify(jsonExport, null, 2));
     console.log(`Results saved to: ${filepath}`);
   }
@@ -412,20 +536,13 @@ const main = async () => {
   const args = process.argv.slice(2);
   const jsonIndex = args.indexOf('--json');
   const exportJson = jsonIndex !== -1;
-  
+
   if (exportJson) {
     args.splice(jsonIndex, 1);
   }
 
   if (args.length === 0 || args.length > 2) {
-    console.error('Usage:');
-    console.error('  For single user: bun run calculate-pnl.ts <vault-address> <user-address> [--json]');
-    console.error('  For all users:   bun run calculate-pnl.ts <vault-address> [--json]');
-    console.error('\nOptions:');
-    console.error('  --json    Export results as JSON to stdout');
-    console.error('\nExamples:');
-    console.error('  bun run calculate-pnl.ts 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37 0x2086a811182F83a023c4dA3dD9d2E5539B2d43C9');
-    console.error('  bun run calculate-pnl.ts 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37 --json > vault-pnl.json');
+    console.error('Misconfigured usage, see README');
     process.exit(1);
   }
 
