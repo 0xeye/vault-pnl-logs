@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 import { writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { VaultEvent, VaultInfo, UserPosition, PnLResult, JsonExport } from './types';
-import { katanaChain } from './chain';
+import { getChainConfig, type ChainName } from './chain';
 import {
   formatPnLResult,
   formatEventForJson,
@@ -15,26 +15,41 @@ import {
   exactToSimple
 } from './helper';
 
-const args = process.argv.slice(2);
-const isJsonExport = args.includes('--json');
+const validChains = ['ethereum', 'base', 'optimism', 'arbitrum', 'polygon', 'katana'] as const;
 
-if (isJsonExport) {
-  dotenv.config({ quiet: true } as any);
-} else {
-  dotenv.config();
-}
+const parseChainArg = (args: string[]): ChainName => {
+  const chainArgIndex = args.indexOf('--chain');
+  
+  if (chainArgIndex !== -1) {
+    if (chainArgIndex + 1 >= args.length) {
+      console.error('Error: --chain requires a chain name');
+      console.error(`Valid chains: ${validChains.join(', ')}`);
+      process.exit(1);
+    }
+    
+    const chainName = args[chainArgIndex + 1].toLowerCase();
+    args.splice(chainArgIndex, 2); // Remove --chain and the chain name
+    
+    if (!validChains.includes(chainName as any)) {
+      console.error(`Error: Invalid chain '${chainName}'`);
+      console.error(`Valid chains: ${validChains.join(', ')}`);
+      process.exit(1);
+    }
+    
+    return chainName as ChainName;
+  }
+  
+  return 'katana'; // Default chain
+};
 
-const KATANA_RPC = process.env.KATANA_RPC_URL;
-
-if (!KATANA_RPC) {
-  console.error('Error: KATANA_RPC_URL environment variable is not set');
-  console.error('Please create a .env file with KATANA_RPC_URL=<your-rpc-url>');
-  process.exit(1);
-}
+// Global variables that will be set in main()
+let selectedChain: ChainName = 'katana';
+let chain: any;
+let rpcUrl: string;
 
 const createClient = () => createPublicClient({
-  chain: katanaChain,
-  transport: http(KATANA_RPC),
+  chain,
+  transport: http(rpcUrl),
 });
 
 const sortEventsByBlock = (events: VaultEvent[]): VaultEvent[] =>
@@ -46,33 +61,50 @@ const calculatePnL = (
   assetDecimals: number,
   vaultDecimals: number
 ): PnLResult => {
-  const netInvested = position.totalAssetsInvested - position.totalAssetsWithdrawn;
+  // If user has shares but no investment (received via transfer), assume cost basis of 1
+  const hasOnlyTransferredShares = position.totalAssetsInvested === 0n && position.totalSharesHeld > 0n;
+  const effectiveAssetsInvested = hasOnlyTransferredShares ? 1n : position.totalAssetsInvested;
+    
+  const netInvested = effectiveAssetsInvested - position.totalAssetsWithdrawn;
   const totalValue = currentValue + position.totalAssetsWithdrawn;
 
   const avgDepositPrice = position.totalSharesDeposited > 0n
-    ? exactToSimple(position.totalAssetsInvested, assetDecimals) / exactToSimple(position.totalSharesDeposited, vaultDecimals)
+    ? exactToSimple(effectiveAssetsInvested, assetDecimals) / exactToSimple(position.totalSharesDeposited, vaultDecimals)
     : 0;
 
+  // For realized PnL calculation
   const costBasisOfWithdrawnShares = position.totalSharesWithdrawn > 0n && position.totalSharesDeposited > 0n
-    ? position.totalAssetsInvested * position.totalSharesWithdrawn / position.totalSharesDeposited
+    ? effectiveAssetsInvested * position.totalSharesWithdrawn / position.totalSharesDeposited
     : 0n;
   const realizedPnL = position.totalAssetsWithdrawn - costBasisOfWithdrawnShares;
 
-  const costBasisOfRemainingShares = position.totalSharesHeld > 0n && position.totalSharesDeposited > 0n
-    ? position.totalAssetsInvested * position.totalSharesHeld / position.totalSharesDeposited
-    : 0n;
+  // For unrealized PnL calculation
+  let costBasisOfRemainingShares: bigint;
+  if (position.totalSharesHeld > 0n) {
+    if (position.totalSharesDeposited > 0n) {
+      // User has deposited - calculate proportional cost basis
+      costBasisOfRemainingShares = effectiveAssetsInvested * position.totalSharesHeld / position.totalSharesDeposited;
+    } else {
+      // User only has transferred shares - assume cost of 1
+      costBasisOfRemainingShares = 1n;
+    }
+  } else {
+    costBasisOfRemainingShares = 0n;
+  }
   const unrealizedPnL = currentValue - costBasisOfRemainingShares;
   
   // totalPnL should be the sum of realized and unrealized
   const calculatedPnl = realizedPnL + unrealizedPnL;
   
-  const pnlPercentage = position.totalAssetsInvested > 0n
-    ? (exactToSimple(calculatedPnl, assetDecimals) / exactToSimple(position.totalAssetsInvested, assetDecimals)) * 100
+  const pnlPercentage = effectiveAssetsInvested > 0n
+    ? (exactToSimple(calculatedPnl, assetDecimals) / exactToSimple(effectiveAssetsInvested, assetDecimals)) * 100
+    : currentValue > 0n
+    ? 100 * Number(currentValue)  // If they have value but no cost, show massive gain
     : 0;
 
   return {
     user: position.user,
-    totalDeposited: position.totalAssetsInvested,
+    totalDeposited: effectiveAssetsInvested,
     totalWithdrawn: position.totalAssetsWithdrawn,
     netInvested,
     currentShares: position.totalSharesHeld,
@@ -97,12 +129,12 @@ const aggregateUserPositions = (events: VaultEvent[]): Record<string, UserPositi
       totalSharesHeld: event.type === 'deposit' || event.type === 'transfer_in'
         ? existingPosition.totalSharesHeld + event.shares
         : existingPosition.totalSharesHeld - event.shares,
-      totalAssetsInvested: event.type === 'deposit' || event.type === 'transfer_in'
+      totalAssetsInvested: event.type === 'deposit'
         ? existingPosition.totalAssetsInvested + event.assets
-        : existingPosition.totalAssetsInvested,
-      totalAssetsWithdrawn: event.type === 'withdraw' || event.type === 'transfer_out'
+        : existingPosition.totalAssetsInvested,  // Don't count transfers as investments
+      totalAssetsWithdrawn: event.type === 'withdraw'
         ? existingPosition.totalAssetsWithdrawn + event.assets
-        : existingPosition.totalAssetsWithdrawn,
+        : existingPosition.totalAssetsWithdrawn,  // Don't count transfers as withdrawals
       totalSharesDeposited: event.type === 'deposit' || event.type === 'transfer_in'
         ? existingPosition.totalSharesDeposited + event.shares
         : existingPosition.totalSharesDeposited,
@@ -113,8 +145,8 @@ const aggregateUserPositions = (events: VaultEvent[]): Record<string, UserPositi
       user,
       events: [event],
       totalSharesHeld: event.type === 'deposit' || event.type === 'transfer_in' ? event.shares : -event.shares,
-      totalAssetsInvested: event.type === 'deposit' || event.type === 'transfer_in' ? event.assets : 0n,
-      totalAssetsWithdrawn: event.type === 'withdraw' || event.type === 'transfer_out' ? event.assets : 0n,
+      totalAssetsInvested: event.type === 'deposit' ? event.assets : 0n,  // Only deposits count as investments
+      totalAssetsWithdrawn: event.type === 'withdraw' ? event.assets : 0n,  // Only withdrawals count
       totalSharesDeposited: event.type === 'deposit' || event.type === 'transfer_in' ? event.shares : 0n,
       totalSharesWithdrawn: event.type === 'withdraw' || event.type === 'transfer_out' ? event.shares : 0n,
     };
@@ -123,6 +155,65 @@ const aggregateUserPositions = (events: VaultEvent[]): Record<string, UserPositi
   }, {} as Record<string, UserPosition>);
 };
 
+
+const getContractDeploymentBlock = async (client: PublicClient, contractAddress: string): Promise<{ block: bigint, timestamp?: bigint }> => {
+  try {
+    // Get the contract bytecode to check if it exists
+    const bytecode = await client.getBytecode({
+      address: contractAddress as `0x${string}`,
+    });
+    
+    if (!bytecode || bytecode === '0x') {
+      throw new Error('Contract not found at this address');
+    }
+
+    // Binary search to find deployment block
+    const currentBlock = await client.getBlockNumber();
+    let low = 0n;
+    let high = currentBlock;
+    let deploymentBlock = 0n;
+    
+    while (low <= high) {
+      const mid = (low + high) / 2n;
+      
+      try {
+        const code = await client.getBytecode({
+          address: contractAddress as `0x${string}`,
+          blockNumber: mid,
+        });
+        
+        if (code && code !== '0x') {
+          // Contract exists at this block, try earlier
+          deploymentBlock = mid;
+          high = mid - 1n;
+        } else {
+          // Contract doesn't exist yet, try later
+          low = mid + 1n;
+        }
+      } catch (error) {
+        // If we get an error, try a later block
+        low = mid + 1n;
+      }
+    }
+    
+    // Get the timestamp of the deployment block
+    try {
+      const block = await client.getBlock({ blockNumber: deploymentBlock });
+      return { block: deploymentBlock, timestamp: block.timestamp };
+    } catch {
+      return { block: deploymentBlock };
+    }
+  } catch (error) {
+    console.warn('Could not determine deployment block, using default fallback');
+    // Return a reasonable fallback based on chain
+    if (selectedChain === 'ethereum') return { block: 18000000n };
+    if (selectedChain === 'base') return { block: 1000000n };
+    if (selectedChain === 'optimism') return { block: 100000000n };
+    if (selectedChain === 'arbitrum') return { block: 150000000n };
+    if (selectedChain === 'polygon') return { block: 40000000n };
+    return { block: 0n };
+  }
+};
 
 const fetchVaultInfo = async (client: PublicClient, vaultAddress: string): Promise<VaultInfo> => {
   const erc4626Abi = parseAbi([
@@ -168,7 +259,7 @@ const fetchVaultEvents = async (
   client: PublicClient,
   vaultAddress: string,
   userAddress?: string
-): Promise<VaultEvent[]> => {
+): Promise<{ events: VaultEvent[], deploymentTimestamp?: bigint }> => {
   const depositEventAbi = parseAbiItem('event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)');
   const withdrawEventAbi = parseAbiItem('event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)');
   const transferEventAbi = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)');
@@ -176,31 +267,205 @@ const fetchVaultEvents = async (
   const depositArgs = userAddress ? { owner: userAddress as `0x${string}` } : undefined;
   const withdrawArgs = userAddress ? { owner: userAddress as `0x${string}` } : undefined;
 
-  const [depositLogs, withdrawLogs, transferLogs] = await Promise.all([
-    client.getLogs({
-      address: vaultAddress as `0x${string}`,
-      event: depositEventAbi,
-      fromBlock: 'earliest',
-      toBlock: 'latest',
-      args: depositArgs,
-    }),
-    client.getLogs({
-      address: vaultAddress as `0x${string}`,
-      event: withdrawEventAbi,
-      fromBlock: 'earliest',
-      toBlock: 'latest',
-      args: withdrawArgs,
-    }),
-    client.getLogs({
-      address: vaultAddress as `0x${string}`,
-      event: transferEventAbi,
-      fromBlock: 'earliest',
-      toBlock: 'latest',
-    }),
-  ]);
+  // Get the deployment block for this vault
+  console.log('Finding vault deployment block...');
+  let deploymentInfo: { block: bigint, timestamp?: bigint } | undefined;
+  let fromBlock: bigint | 'earliest';
+  
+  if (selectedChain === 'katana') {
+    fromBlock = 'earliest' as const;
+  } else {
+    deploymentInfo = await getContractDeploymentBlock(client, vaultAddress);
+    fromBlock = deploymentInfo.block;
+    
+    if (deploymentInfo.timestamp) {
+      const deploymentDate = new Date(Number(deploymentInfo.timestamp) * 1000);
+      const formattedDate = deploymentDate.toLocaleDateString('en-US', { 
+        year: 'numeric', 
+        month: 'long', 
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZoneName: 'short'
+      });
+      console.log(`Vault deployed at block ${fromBlock} on ${formattedDate}`);
+    } else {
+      console.log(`Vault deployed at block ${fromBlock}, searching from there...`);
+    }
+  }
 
+  // For non-Katana chains, we need to batch requests to avoid RPC limits
+  const currentBlock = await client.getBlockNumber();
+  const BATCH_SIZE = 10000n; // Query 10k blocks at a time for better reliability
+  
+  let depositLogs: any[] = [];
+  let withdrawLogs: any[] = [];
+  let transferLogs: any[] = [];
+  
+  // Track fetching progress
+  const failedRanges: Array<{ start: bigint, end: bigint }> = [];
+  const successfulRanges: Array<{ start: bigint, end: bigint }> = [];
+  
+  if (selectedChain === 'katana') {
+    // For Katana, we can use 'earliest' and 'latest'
+    [depositLogs, withdrawLogs, transferLogs] = await Promise.all([
+      client.getLogs({
+        address: vaultAddress as `0x${string}`,
+        event: depositEventAbi,
+        fromBlock,
+        toBlock: 'latest',
+        args: depositArgs,
+      }),
+      client.getLogs({
+        address: vaultAddress as `0x${string}`,
+        event: withdrawEventAbi,
+        fromBlock,
+        toBlock: 'latest',
+        args: withdrawArgs,
+      }),
+      client.getLogs({
+        address: vaultAddress as `0x${string}`,
+        event: transferEventAbi,
+        fromBlock,
+        toBlock: 'latest',
+      }),
+    ]);
+  } else {
+    // For other chains, batch the requests
+    const startBlock = fromBlock as bigint;
+    const totalBlocks = currentBlock - startBlock;
+    let processedBlocks = 0n;
+    
+    for (let batchStart = startBlock; batchStart <= currentBlock; batchStart += BATCH_SIZE) {
+      const batchEnd = batchStart + BATCH_SIZE - 1n > currentBlock ? currentBlock : batchStart + BATCH_SIZE - 1n;
+      const progress = ((processedBlocks * 100n) / totalBlocks).toString();
+      
+      console.log(`Fetching events: ${progress}% complete (blocks ${batchStart} to ${batchEnd})...`);
+      
+      try {
+        const [batchDeposits, batchWithdraws, batchTransfers] = await Promise.all([
+          client.getLogs({
+            address: vaultAddress as `0x${string}`,
+            event: depositEventAbi,
+            fromBlock: batchStart,
+            toBlock: batchEnd,
+            args: depositArgs,
+          }),
+          client.getLogs({
+            address: vaultAddress as `0x${string}`,
+            event: withdrawEventAbi,
+            fromBlock: batchStart,
+            toBlock: batchEnd,
+            args: withdrawArgs,
+          }),
+          client.getLogs({
+            address: vaultAddress as `0x${string}`,
+            event: transferEventAbi,
+            fromBlock: batchStart,
+            toBlock: batchEnd,
+          }),
+        ]);
+        
+        depositLogs.push(...batchDeposits);
+        withdrawLogs.push(...batchWithdraws);
+        transferLogs.push(...batchTransfers);
+        successfulRanges.push({ start: batchStart, end: batchEnd });
+        processedBlocks = batchEnd - startBlock + 1n;
+      } catch (error: any) {
+        console.warn(`Failed to fetch events for blocks ${batchStart}-${batchEnd}:`, error?.message || error);
+        console.warn('Retrying with smaller batch...');
+        
+        // Try with smaller batches
+        const SMALL_BATCH = 1000n;
+        let smallBatchProcessed = 0n;
+        const smallBatchTotal = batchEnd - batchStart + 1n;
+        let anySmallBatchSucceeded = false;
+        
+        for (let smallStart = batchStart; smallStart <= batchEnd; smallStart += SMALL_BATCH) {
+          const smallEnd = smallStart + SMALL_BATCH - 1n > batchEnd ? batchEnd : smallStart + SMALL_BATCH - 1n;
+          const smallProgress = ((smallBatchProcessed * 100n) / smallBatchTotal).toString();
+          process.stdout.write(`\r  Retry progress: ${smallProgress}% of current batch...`);
+          
+          try {
+            const [smallDeposits, smallWithdraws, smallTransfers] = await Promise.all([
+              client.getLogs({
+                address: vaultAddress as `0x${string}`,
+                event: depositEventAbi,
+                fromBlock: smallStart,
+                toBlock: smallEnd,
+                args: depositArgs,
+              }),
+              client.getLogs({
+                address: vaultAddress as `0x${string}`,
+                event: withdrawEventAbi,
+                fromBlock: smallStart,
+                toBlock: smallEnd,
+                args: withdrawArgs,
+              }),
+              client.getLogs({
+                address: vaultAddress as `0x${string}`,
+                event: transferEventAbi,
+                fromBlock: smallStart,
+                toBlock: smallEnd,
+              }),
+            ]);
+            
+            depositLogs.push(...smallDeposits);
+            withdrawLogs.push(...smallWithdraws);
+            transferLogs.push(...smallTransfers);
+            successfulRanges.push({ start: smallStart, end: smallEnd });
+            anySmallBatchSucceeded = true;
+            smallBatchProcessed = smallEnd - batchStart + 1n;
+          } catch (smallError) {
+            // Track this failed range
+            failedRanges.push({ start: smallStart, end: smallEnd });
+            console.warn(`\n  Failed to fetch blocks ${smallStart}-${smallEnd} even with small batch`);
+            smallBatchProcessed = smallEnd - batchStart + 1n;
+          }
+        }
+        
+        if (!anySmallBatchSucceeded) {
+          // If no small batches succeeded, track the entire range as failed
+          failedRanges.push({ start: batchStart, end: batchEnd });
+        }
+        
+        process.stdout.write('\n'); // New line after retry progress
+        processedBlocks = batchEnd - startBlock + 1n;
+      }
+    }
+    console.log('Event fetching complete!');
+    
+    // Report any failed ranges
+    if (failedRanges.length > 0) {
+      console.warn(`\n⚠️  WARNING: Failed to fetch events from ${failedRanges.length} block ranges:`);
+      failedRanges.forEach(range => {
+        console.warn(`  - Blocks ${range.start} to ${range.end}`);
+      });
+      console.warn('This may result in incomplete data!\n');
+    }
+  }
+
+  // Deduplicate events using transaction hash + log index
+  const uniqueEventIds = new Set<string>();
+  const dedupLog = (log: any) => {
+    const eventId = `${log.transactionHash}-${log.logIndex}`;
+    if (uniqueEventIds.has(eventId)) {
+      return false;
+    }
+    uniqueEventIds.add(eventId);
+    return true;
+  };
+  
+  const uniqueDepositLogs = depositLogs.filter(dedupLog);
+  const uniqueWithdrawLogs = withdrawLogs.filter(dedupLog);
+  const uniqueTransferLogs = transferLogs.filter(dedupLog);
+  
+  console.log(`Deduplication: ${depositLogs.length - uniqueDepositLogs.length} duplicate deposits removed`);
+  console.log(`Deduplication: ${withdrawLogs.length - uniqueWithdrawLogs.length} duplicate withdrawals removed`);
+  console.log(`Deduplication: ${transferLogs.length - uniqueTransferLogs.length} duplicate transfers removed`);
+  
   const events: VaultEvent[] = [
-    ...depositLogs.map(log => ({
+    ...uniqueDepositLogs.map(log => ({
       type: 'deposit' as const,
       blockNumber: log.blockNumber!,
       transactionHash: log.transactionHash,
@@ -208,7 +473,7 @@ const fetchVaultEvents = async (
       assets: log.args.assets!,
       shares: log.args.shares!,
     })),
-    ...withdrawLogs.map(log => ({
+    ...uniqueWithdrawLogs.map(log => ({
       type: 'withdraw' as const,
       blockNumber: log.blockNumber!,
       transactionHash: log.transactionHash,
@@ -222,7 +487,7 @@ const fetchVaultEvents = async (
     const userLower = userAddress.toLowerCase();
     const zeroAddress = '0x0000000000000000000000000000000000000000';
     
-    const relevantTransfers = transferLogs.filter(log => {
+    const relevantTransfers = uniqueTransferLogs.filter(log => {
       const from = log.args.from!.toLowerCase();
       const to = log.args.to!.toLowerCase();
       
@@ -249,7 +514,7 @@ const fetchVaultEvents = async (
     const zeroAddress = '0x0000000000000000000000000000000000000000';
     const vaultLower = vaultAddress.toLowerCase();
     
-    const userTransfers = transferLogs.filter(log => {
+    const userTransfers = uniqueTransferLogs.filter(log => {
       const from = log.args.from!.toLowerCase();
       const to = log.args.to!.toLowerCase();
       
@@ -284,7 +549,7 @@ const fetchVaultEvents = async (
     events.push(...transferEvents);
   }
 
-  return sortEventsByBlock(events);
+  return { events: sortEventsByBlock(events), deploymentTimestamp: deploymentInfo?.timestamp };
 };
 
 const enrichEventsWithPricePerShare = async (
@@ -411,6 +676,7 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
   const client = createClient();
 
   if (!exportJson) {
+    console.log('Chain:', selectedChain);
     console.log('Calculating PnL for:', userAddress || 'All vault users');
     console.log('Vault:', vaultAddress);
     console.log('---\n');
@@ -423,7 +689,7 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
     console.log('---\n');
   }
 
-  const events = await fetchVaultEvents(client, vaultAddress, userAddress);
+  const { events, deploymentTimestamp } = await fetchVaultEvents(client, vaultAddress, userAddress);
   const enrichedEvents = await enrichEventsWithPricePerShare(
     client,
     vaultAddress,
@@ -432,6 +698,23 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
   );
 
   const positions = aggregateUserPositions(enrichedEvents);
+  
+  // Count events by type for validation
+  const eventCounts = {
+    deposits: enrichedEvents.filter(e => e.type === 'deposit').length,
+    withdrawals: enrichedEvents.filter(e => e.type === 'withdraw').length,
+    transfersIn: enrichedEvents.filter(e => e.type === 'transfer_in').length,
+    transfersOut: enrichedEvents.filter(e => e.type === 'transfer_out').length,
+  };
+  
+  if (!exportJson) {
+    console.log(`\n=== Event Summary ===`);
+    console.log(`Deposits: ${eventCounts.deposits}`);
+    console.log(`Withdrawals: ${eventCounts.withdrawals}`);
+    console.log(`Transfers In: ${eventCounts.transfersIn}`);
+    console.log(`Transfers Out: ${eventCounts.transfersOut}`);
+    console.log(`Total Events: ${enrichedEvents.length}`);
+  }
 
   const currentValues = await getCurrentShareValues(client, vaultAddress, positions);
 
@@ -472,12 +755,50 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
 
   if (!exportJson) {
     console.log('\n=== PnL Summary ===');
+    
+    // Validate transfer balance
+    if (eventCounts.transfersIn !== eventCounts.transfersOut) {
+      console.warn(`⚠️  WARNING: Transfer imbalance detected!`);
+      console.warn(`   Transfers In: ${eventCounts.transfersIn}, Transfers Out: ${eventCounts.transfersOut}`);
+      console.warn(`   This should not happen in a properly functioning vault\n`);
+    }
+  }
+  
+  // Calculate APR if deployment was less than 1 year ago
+  let annualizedReturn: number | undefined;
+  
+  if (deploymentTimestamp) {
+    const now = Date.now() / 1000;
+    const deploymentTime = Number(deploymentTimestamp);
+    const secondsActive = now - deploymentTime;
+    const daysActive = secondsActive / 86400;
+    
+    if (daysActive < 365 && daysActive > 0) {
+      // Will be calculated per user or for total below
+      if (!exportJson) {
+        console.log(`Vault age: ${daysActive.toFixed(1)} days`);
+      }
+    }
   }
 
   if (results.length === 1) {
     const result = results[0];
+    
+    // Calculate APR for single user
+    if (deploymentTimestamp && result.pnlPercentage !== 0) {
+      const now = Date.now() / 1000;
+      const deploymentTime = Number(deploymentTimestamp);
+      const secondsActive = now - deploymentTime;
+      const daysActive = secondsActive / 86400;
+      
+      if (daysActive < 365 && daysActive > 0) {
+        const yearFraction = daysActive / 365;
+        annualizedReturn = result.pnlPercentage / yearFraction;
+      }
+    }
+    
     if (!exportJson) {
-      console.log(formatPnLResult(result, vaultInfo.assetSymbol, vaultInfo.assetDecimals, vaultInfo.decimals));
+      console.log(formatPnLResult(result, vaultInfo.assetSymbol, vaultInfo.assetDecimals, vaultInfo.decimals, annualizedReturn));
     } else {
       jsonExport.summary = formatSummaryForJson(
         { totalDeposited: result.totalDeposited, totalWithdrawn: result.totalWithdrawn, pnl: result.pnl, realizedPnL: result.realizedPnL, unrealizedPnL: result.unrealizedPnL },
@@ -513,8 +834,21 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
       ? (exactToSimple(totals.pnl, vaultInfo.assetDecimals) / exactToSimple(totals.totalDeposited, vaultInfo.assetDecimals)) * 100
       : 0;
 
+    // Calculate APR for vault total
+    if (deploymentTimestamp && totalPnlPercentage !== 0) {
+      const now = Date.now() / 1000;
+      const deploymentTime = Number(deploymentTimestamp);
+      const secondsActive = now - deploymentTime;
+      const daysActive = secondsActive / 86400;
+      
+      if (daysActive < 365 && daysActive > 0) {
+        const yearFraction = daysActive / 365;
+        annualizedReturn = totalPnlPercentage / yearFraction;
+      }
+    }
+    
     if (!exportJson) {
-      console.log(formatVaultSummaryForConsole(results, totals, totalNetInvested, totalCurrentValue, totalValue, totalPnlPercentage, vaultInfo));
+      console.log(formatVaultSummaryForConsole(results, totals, totalNetInvested, totalCurrentValue, totalValue, totalPnlPercentage, vaultInfo, annualizedReturn));
 
       const sortedByPnl = [...results].sort((a, b) => exactToSimple(b.pnl, vaultInfo.assetDecimals) - exactToSimple(a.pnl, vaultInfo.assetDecimals));
       console.log(formatTopMoversForConsole('Top 5 Gainers', sortedByPnl.slice(0, 5), vaultInfo));
@@ -543,15 +877,58 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
 
 const main = async () => {
   const args = process.argv.slice(2);
+  
+  // Check for help first before modifying args
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log('Usage: bun run calculate-pnl.ts [options] <vault_address> [user_address]');
+    console.log('\nOptions:');
+    console.log('  --chain <name>    Select blockchain (ethereum, base, optimism, arbitrum, polygon, katana)');
+    console.log('                    Default: katana');
+    console.log('  --json            Export results to JSON file');
+    console.log('  --help, -h        Show this help message');
+    console.log('\nExamples:');
+    console.log('  bun run calculate-pnl.ts 0x123... 0x456...                    # Use default chain (katana)');
+    console.log('  bun run calculate-pnl.ts --chain ethereum 0x123... 0x456...');
+    console.log('  bun run calculate-pnl.ts --chain base 0x123...');
+    console.log('  bun run calculate-pnl.ts --chain polygon --json 0x123...');
+    process.exit(0);
+  }
+  
+  // Parse all flags first before checking args
+  const isJsonExport = args.includes('--json');
+  
+  if (isJsonExport) {
+    dotenv.config({ quiet: true } as any);
+  } else {
+    dotenv.config();
+  }
+  
+  // Remove --json flag if present
   const jsonIndex = args.indexOf('--json');
   const exportJson = jsonIndex !== -1;
-
   if (exportJson) {
     args.splice(jsonIndex, 1);
   }
-
+  
+  // Parse and remove --chain flag
+  selectedChain = parseChainArg(args);
+  
+  // Get chain configuration
+  const config = getChainConfig(selectedChain);
+  chain = config.chain;
+  rpcUrl = config.rpcUrl;
+  
+  if (!rpcUrl && selectedChain === 'katana') {
+    console.error('Error: KATANA_RPC_URL environment variable is not set');
+    console.error('Please create a .env file with KATANA_RPC_URL=<your-rpc-url>');
+    process.exit(1);
+  }
+  
+  // Now check remaining args (should be vault address and optional user address)
   if (args.length === 0 || args.length > 2) {
-    console.error('Misconfigured usage, see README');
+    console.error('Error: Invalid number of arguments');
+    console.error('Usage: bun run calculate-pnl.ts [options] <vault_address> [user_address]');
+    console.error('Run with --help for more information');
     process.exit(1);
   }
 

@@ -23,9 +23,10 @@ export const formatPnLResult = (
   result: PnLResult,
   assetSymbol: string,
   assetDecimals: number,
-  vaultDecimals: number
+  vaultDecimals: number,
+  annualizedReturn?: number
 ): string => {
-  return `
+  let output = `
 User: ${result.user}
 Total deposited: ${formatUnits(result.totalDeposited, assetDecimals)} ${assetSymbol}
 Total withdrawn: ${formatUnits(result.totalWithdrawn, assetDecimals)} ${assetSymbol}
@@ -37,6 +38,12 @@ Avg deposit price: ${result.avgDepositPrice.toFixed(assetDecimals)} ${assetSymbo
 Total PnL: ${formatUnits(result.pnl, assetDecimals)} ${assetSymbol} (${result.pnlPercentage.toFixed(4)}%)
   Realized PnL: ${formatUnits(result.realizedPnL, assetDecimals)} ${assetSymbol}
   Unrealized PnL: ${formatUnits(result.unrealizedPnL, assetDecimals)} ${assetSymbol}`;
+  
+  if (annualizedReturn !== undefined) {
+    output += `\nAnnualized Return (APR): ${annualizedReturn.toFixed(2)}%`;
+  }
+  
+  return output;
 };
 
 export const formatEventForJson = (
@@ -132,9 +139,10 @@ export const formatVaultSummaryForConsole = (
   totalCurrentValue: bigint,
   totalValue: bigint,
   totalPnlPercentage: number,
-  vaultInfo: VaultInfo
+  vaultInfo: VaultInfo,
+  annualizedReturn?: number
 ): string => {
-  return `Total users: ${results.length}
+  let output = `Total users: ${results.length}
 Total deposited: ${formatUnits(totals.totalDeposited, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol}
 Total withdrawn: ${formatUnits(totals.totalWithdrawn, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol}
 Total net invested: ${formatUnits(totalNetInvested, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol}
@@ -144,6 +152,12 @@ Total value: ${formatUnits(totalValue, vaultInfo.assetDecimals)} ${vaultInfo.ass
 Total PnL: ${formatUnits(totals.pnl, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol} (${totalPnlPercentage.toFixed(4)}%)
   Realized PnL: ${formatUnits(totals.realizedPnL, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol}
   Unrealized PnL: ${formatUnits(totals.unrealizedPnL, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol}`;
+  
+  if (annualizedReturn !== undefined) {
+    output += `\nAnnualized Return (APR): ${annualizedReturn.toFixed(2)}%`;
+  }
+  
+  return output;
 };
 
 export const formatTopMoversForConsole = (

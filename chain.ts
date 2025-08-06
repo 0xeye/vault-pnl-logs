@@ -1,4 +1,5 @@
 import { defineChain } from 'viem';
+import { mainnet, base, optimism, arbitrum, polygon } from 'viem/chains';
 
 export const katanaChain = defineChain({
   id: 747474,
@@ -20,3 +21,29 @@ export const katanaChain = defineChain({
     },
   },
 });
+
+export const chains = {
+  ethereum: mainnet,
+  base,
+  optimism,
+  arbitrum,
+  polygon,
+  katana: katanaChain,
+} as const;
+
+export type ChainName = keyof typeof chains;
+
+export const defaultRpcUrls: Record<ChainName, string> = {
+  ethereum: 'https://ethereum-rpc.publicnode.com',
+  base: 'https://base-rpc.publicnode.com',
+  optimism: 'https://optimism-rpc.publicnode.com',
+  arbitrum: 'https://arbitrum-one-rpc.publicnode.com',
+  polygon: 'https://polygon-bor-rpc.publicnode.com',
+  katana: process.env.KATANA_RPC_URL || '',
+};
+
+export const getChainConfig = (chainName: ChainName) => {
+  const chain = chains[chainName];
+  const rpcUrl = process.env[`${chainName.toUpperCase()}_RPC_URL`] || defaultRpcUrls[chainName];
+  return { chain, rpcUrl };
+};
