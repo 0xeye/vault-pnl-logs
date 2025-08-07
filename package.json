@@ -1,20 +1,21 @@
 {
   "name": "log-test",
   "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "calculate-pnl": "bun run src/index.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
   "author": "",
-  "license": "ISC",
-  "description": "",
+  "main": "index.js",
   "dependencies": {
+    "@biomejs/biome": "^2.1.4",
     "@types/node": "^24.1.0",
     "dotenv": "^17.2.1",
     "tsx": "^4.20.3",
     "typescript": "^5.9.2",
     "viem": "^2.33.2"
+  },
+  "description": "",
+  "keywords": [],
+  "license": "ISC",
+  "scripts": {
+    "calculate-pnl": "bun run src/index.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
   }
 }

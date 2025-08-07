@@ -1,7 +1,7 @@
 import { parseAbi, type PublicClient } from 'viem';
 import { UserPosition, PnLResult } from '../types';
 import { exactToSimple } from '../helper';
-import { add, subtract, multiply, divide, safeRatio, isPositive, ZERO } from './utils/bigint';
+import { add, subtract, multiply, divide, isPositive, ZERO } from './utils/bigint';
 
 const calculateCostBasis = (
   totalInvested: bigint,

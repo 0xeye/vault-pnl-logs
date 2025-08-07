@@ -1,5 +1,5 @@
-import { writeFileSync, mkdirSync, existsSync } from 'fs';
-import { join } from 'path';
+import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { PnLResult, JsonExport, VaultInfo, UserPosition } from '../types';
 import {
   formatPnLResult,

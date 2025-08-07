@@ -2,7 +2,6 @@ import { VaultEvent, UserPosition } from '../types';
 import { add, subtract, ZERO } from './utils/bigint';
 
 const isDeposit = (type: VaultEvent['type']): boolean => type === 'deposit';
-const isWithdraw = (type: VaultEvent['type']): boolean => type === 'withdraw';
 
 interface PositionUpdate {
   shares: bigint;
@@ -16,7 +15,7 @@ const createInitialPosition = (user: string, event: VaultEvent): UserPosition =>
     assets: event.assets,
     isDeposit: isDeposit(event.type),
   };
-  
+
   return {
     user,
     events: [event],
