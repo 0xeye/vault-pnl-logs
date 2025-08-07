@@ -62,10 +62,10 @@ const calculatePnL = (
     ? position.totalAssetsInvested * position.totalSharesHeld / position.totalSharesDeposited
     : 0n;
   const unrealizedPnL = currentValue - costBasisOfRemainingShares;
-  
+
   // totalPnL should be the sum of realized and unrealized
   const calculatedPnl = realizedPnL + unrealizedPnL;
-  
+
   const pnlPercentage = position.totalAssetsInvested > 0n
     ? (exactToSimple(calculatedPnl, assetDecimals) / exactToSimple(position.totalAssetsInvested, assetDecimals)) * 100
     : 0;
@@ -88,35 +88,36 @@ const calculatePnL = (
 
 const aggregateUserPositions = (events: VaultEvent[]): Record<string, UserPosition> => {
   return events.reduce((positions, event) => {
-    const user = event.user.toLowerCase();
+    const { user: _user, shares, assets, type } = event;
+    const user = _user.toLowerCase();
     const existingPosition = positions[user];
 
     const updatedPosition: UserPosition = existingPosition ? {
       ...existingPosition,
       events: [...existingPosition.events, event],
-      totalSharesHeld: event.type === 'deposit' || event.type === 'transfer_in'
-        ? existingPosition.totalSharesHeld + event.shares
-        : existingPosition.totalSharesHeld - event.shares,
-      totalAssetsInvested: event.type === 'deposit' || event.type === 'transfer_in'
-        ? existingPosition.totalAssetsInvested + event.assets
+      totalSharesHeld: type === 'deposit'
+        ? existingPosition.totalSharesHeld + shares
+        : existingPosition.totalSharesHeld - shares,
+      totalAssetsInvested: type === 'deposit'
+        ? existingPosition.totalAssetsInvested + assets
         : existingPosition.totalAssetsInvested,
-      totalAssetsWithdrawn: event.type === 'withdraw' || event.type === 'transfer_out'
-        ? existingPosition.totalAssetsWithdrawn + event.assets
+      totalAssetsWithdrawn: type === 'withdraw'
+        ? existingPosition.totalAssetsWithdrawn + assets
         : existingPosition.totalAssetsWithdrawn,
-      totalSharesDeposited: event.type === 'deposit' || event.type === 'transfer_in'
-        ? existingPosition.totalSharesDeposited + event.shares
+      totalSharesDeposited: type === 'deposit'
+        ? existingPosition.totalSharesDeposited + shares
         : existingPosition.totalSharesDeposited,
-      totalSharesWithdrawn: event.type === 'withdraw' || event.type === 'transfer_out'
-        ? existingPosition.totalSharesWithdrawn + event.shares
+      totalSharesWithdrawn: type === 'withdraw'
+        ? existingPosition.totalSharesWithdrawn + shares
         : existingPosition.totalSharesWithdrawn,
     } : {
       user,
       events: [event],
-      totalSharesHeld: event.type === 'deposit' || event.type === 'transfer_in' ? event.shares : -event.shares,
-      totalAssetsInvested: event.type === 'deposit' || event.type === 'transfer_in' ? event.assets : 0n,
-      totalAssetsWithdrawn: event.type === 'withdraw' || event.type === 'transfer_out' ? event.assets : 0n,
-      totalSharesDeposited: event.type === 'deposit' || event.type === 'transfer_in' ? event.shares : 0n,
-      totalSharesWithdrawn: event.type === 'withdraw' || event.type === 'transfer_out' ? event.shares : 0n,
+      totalSharesHeld: type === 'deposit' ? shares : -shares,
+      totalAssetsInvested: type === 'deposit' ? assets : 0n,
+      totalAssetsWithdrawn: type === 'withdraw' ? assets : 0n,
+      totalSharesDeposited: type === 'deposit' ? shares : 0n,
+      totalSharesWithdrawn: type === 'withdraw' ? shares : 0n,
     };
 
     return { ...positions, [user]: updatedPosition };
@@ -171,12 +172,11 @@ const fetchVaultEvents = async (
 ): Promise<VaultEvent[]> => {
   const depositEventAbi = parseAbiItem('event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)');
   const withdrawEventAbi = parseAbiItem('event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)');
-  const transferEventAbi = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)');
 
   const depositArgs = userAddress ? { owner: userAddress as `0x${string}` } : undefined;
   const withdrawArgs = userAddress ? { owner: userAddress as `0x${string}` } : undefined;
 
-  const [depositLogs, withdrawLogs, transferLogs] = await Promise.all([
+  const [depositLogs, withdrawLogs] = await Promise.all([
     client.getLogs({
       address: vaultAddress as `0x${string}`,
       event: depositEventAbi,
@@ -190,12 +190,6 @@ const fetchVaultEvents = async (
       fromBlock: 'earliest',
       toBlock: 'latest',
       args: withdrawArgs,
-    }),
-    client.getLogs({
-      address: vaultAddress as `0x${string}`,
-      event: transferEventAbi,
-      fromBlock: 'earliest',
-      toBlock: 'latest',
     }),
   ]);
 
@@ -218,71 +212,6 @@ const fetchVaultEvents = async (
     })),
   ];
 
-  if (userAddress) {
-    const userLower = userAddress.toLowerCase();
-    const zeroAddress = '0x0000000000000000000000000000000000000000';
-    
-    const relevantTransfers = transferLogs.filter(log => {
-      const from = log.args.from!.toLowerCase();
-      const to = log.args.to!.toLowerCase();
-      
-      return (to === userLower && from !== zeroAddress && from !== userLower) ||
-             (from === userLower && to !== zeroAddress && to !== userLower);
-    });
-
-    const transferEvents = relevantTransfers.map(log => {
-      const isIncoming = log.args.to!.toLowerCase() === userLower;
-      return {
-        type: isIncoming ? ('transfer_in' as const) : ('transfer_out' as const),
-        blockNumber: log.blockNumber!,
-        transactionHash: log.transactionHash,
-        user: userLower,
-        assets: 0n,
-        shares: log.args.value!,
-        from: log.args.from!,
-        to: log.args.to!,
-      };
-    });
-
-    events.push(...transferEvents);
-  } else {
-    const zeroAddress = '0x0000000000000000000000000000000000000000';
-    const vaultLower = vaultAddress.toLowerCase();
-    
-    const userTransfers = transferLogs.filter(log => {
-      const from = log.args.from!.toLowerCase();
-      const to = log.args.to!.toLowerCase();
-      
-      return from !== zeroAddress && to !== zeroAddress && 
-             from !== vaultLower && to !== vaultLower &&
-             from !== to;
-    });
-
-    const transferEvents = userTransfers.flatMap(log => [
-      {
-        type: 'transfer_in' as const,
-        blockNumber: log.blockNumber!,
-        transactionHash: log.transactionHash,
-        user: log.args.to!,
-        assets: 0n,
-        shares: log.args.value!,
-        from: log.args.from!,
-        to: log.args.to!,
-      },
-      {
-        type: 'transfer_out' as const,
-        blockNumber: log.blockNumber!,
-        transactionHash: log.transactionHash,
-        user: log.args.from!,
-        assets: 0n,
-        shares: log.args.value!,
-        from: log.args.from!,
-        to: log.args.to!,
-      }
-    ]);
-
-    events.push(...transferEvents);
-  }
 
   return sortEventsByBlock(events);
 };
@@ -294,70 +223,13 @@ const enrichEventsWithPricePerShare = async (
   events: VaultEvent[]
 ): Promise<VaultEvent[]> => {
   const oneShare = 10n ** BigInt(vaultDecimals);
-  const erc4626Abi = parseAbi([
-    'function convertToAssets(uint256 shares) view returns (uint256)',
-  ]);
-
-  const transferEvents = events.filter(e => e.type === 'transfer_in' || e.type === 'transfer_out');
-  const uniqueTransferBlocks = [...new Set(transferEvents.map(e => e.blockNumber))];
-  const blockPriceMap: Record<string, bigint> = {};
-  
-  if (uniqueTransferBlocks.length > 0) {
-    const BATCH_SIZE = 20;
-    for (let i = 0; i < uniqueTransferBlocks.length; i += BATCH_SIZE) {
-      const blockBatch = uniqueTransferBlocks.slice(i, i + BATCH_SIZE);
-      
-      const results = await Promise.all(
-        blockBatch.map(async (blockNumber) => {
-          const contracts = [{
-            address: vaultAddress as `0x${string}`,
-            abi: erc4626Abi,
-            functionName: 'convertToAssets',
-            args: [oneShare],
-          }];
-
-          const result = await client.multicall({
-            contracts,
-            blockNumber,
-            allowFailure: false,
-          });
-
-          return { blockNumber, pricePerShare: result[0] };
-        })
-      );
-      
-      results.forEach(({ blockNumber, pricePerShare }) => {
-        blockPriceMap[blockNumber.toString()] = pricePerShare;
-      });
-      
-      if (i + BATCH_SIZE < uniqueTransferBlocks.length) {
-        console.log(`Fetched prices for ${i + BATCH_SIZE} of ${uniqueTransferBlocks.length} transfer blocks...`);
-        await new Promise(resolve => setTimeout(resolve, 200));
-      }
-    }
-  }
 
   return events.map(event => {
-    if (event.type === 'deposit' || event.type === 'withdraw') {
-      const pricePerShare = (event.assets * oneShare) / event.shares;
-      return {
-        ...event,
-        pricePerShare,
-      };
-    }
-    
-    if (event.type === 'transfer_in' || event.type === 'transfer_out') {
-      const pricePerShare = blockPriceMap[event.blockNumber.toString()];
-      const assets = (event.shares * pricePerShare) / oneShare;
-      
-      return {
-        ...event,
-        assets,
-        pricePerShare,
-      };
-    }
-    
-    return event;
+    const pricePerShare = (event.assets * oneShare) / event.shares;
+    return {
+      ...event,
+      pricePerShare,
+    };
   });
 };
 
@@ -455,10 +327,8 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
     if (position && !exportJson) {
       const deposits = position.events.filter(e => e.type === 'deposit').length;
       const withdrawals = position.events.filter(e => e.type === 'withdraw').length;
-      const transfersIn = position.events.filter(e => e.type === 'transfer_in').length;
-      const transfersOut = position.events.filter(e => e.type === 'transfer_out').length;
-      
-      console.log(`Found ${deposits} deposits, ${withdrawals} withdrawals, ${transfersIn} transfers in, ${transfersOut} transfers out\n`);
+
+      console.log(`Found ${deposits} deposits, ${withdrawals} withdrawals\n`);
 
       position.events.map((event, index) =>
         console.log(formatEventForConsole(event, index, vaultInfo))
@@ -515,10 +385,8 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
 
     if (!exportJson) {
       console.log(formatVaultSummaryForConsole(results, totals, totalNetInvested, totalCurrentValue, totalValue, totalPnlPercentage, vaultInfo));
-
       const sortedByPnl = [...results].sort((a, b) => exactToSimple(b.pnl, vaultInfo.assetDecimals) - exactToSimple(a.pnl, vaultInfo.assetDecimals));
       console.log(formatTopMoversForConsole('Top 5 Gainers', sortedByPnl.slice(0, 5), vaultInfo));
-      console.log(formatTopMoversForConsole('Top 5 Losers', sortedByPnl.slice(-5).reverse(), vaultInfo));
     } else {
       jsonExport.summary = formatSummaryForJson(totals, totalNetInvested, totalCurrentValue, totalValue, totalPnlPercentage, vaultInfo, results.length);
       jsonExport.users = results.map(result => formatPnLForJson(result, vaultInfo));
@@ -530,7 +398,7 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
     if (!existsSync(dataDir)) {
       mkdirSync(dataDir);
     }
-    
+
     const filename = userAddress
       ? `${userAddress.toLowerCase()}-${vaultAddress.toLowerCase()}.json`
       : `${vaultAddress.toLowerCase()}.json`;
