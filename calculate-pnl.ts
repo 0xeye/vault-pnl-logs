@@ -1,4 +1,4 @@
-import { createPublicClient, http, parseAbiItem, isAddress, parseAbi, type PublicClient, type Log } from 'viem';
+import { createPublicClient, http, parseAbiItem, isAddress, parseAbi, formatUnits, type PublicClient, type Log } from 'viem';
 import dotenv from 'dotenv';
 import { writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
@@ -126,29 +126,39 @@ const aggregateUserPositions = (events: VaultEvent[]): Record<string, UserPositi
     const updatedPosition: UserPosition = existingPosition ? {
       ...existingPosition,
       events: [...existingPosition.events, event],
-      totalSharesHeld: event.type === 'deposit' || event.type === 'transfer_in'
+      totalSharesHeld: event.type === 'deposit'
         ? existingPosition.totalSharesHeld + event.shares
-        : existingPosition.totalSharesHeld - event.shares,
+        : event.type === 'withdraw'
+        ? existingPosition.totalSharesHeld - event.shares
+        : event.type === 'transfer_in'
+        ? existingPosition.totalSharesHeld + event.shares
+        : event.type === 'transfer_out'
+        ? existingPosition.totalSharesHeld - event.shares
+        : existingPosition.totalSharesHeld,
       totalAssetsInvested: event.type === 'deposit'
         ? existingPosition.totalAssetsInvested + event.assets
-        : existingPosition.totalAssetsInvested,  // Don't count transfers as investments
+        : existingPosition.totalAssetsInvested,
       totalAssetsWithdrawn: event.type === 'withdraw'
         ? existingPosition.totalAssetsWithdrawn + event.assets
-        : existingPosition.totalAssetsWithdrawn,  // Don't count transfers as withdrawals
-      totalSharesDeposited: event.type === 'deposit' || event.type === 'transfer_in'
+        : existingPosition.totalAssetsWithdrawn,
+      totalSharesDeposited: event.type === 'deposit'
         ? existingPosition.totalSharesDeposited + event.shares
         : existingPosition.totalSharesDeposited,
-      totalSharesWithdrawn: event.type === 'withdraw' || event.type === 'transfer_out'
+      totalSharesWithdrawn: event.type === 'withdraw'
         ? existingPosition.totalSharesWithdrawn + event.shares
         : existingPosition.totalSharesWithdrawn,
     } : {
       user,
       events: [event],
-      totalSharesHeld: event.type === 'deposit' || event.type === 'transfer_in' ? event.shares : -event.shares,
-      totalAssetsInvested: event.type === 'deposit' ? event.assets : 0n,  // Only deposits count as investments
-      totalAssetsWithdrawn: event.type === 'withdraw' ? event.assets : 0n,  // Only withdrawals count
-      totalSharesDeposited: event.type === 'deposit' || event.type === 'transfer_in' ? event.shares : 0n,
-      totalSharesWithdrawn: event.type === 'withdraw' || event.type === 'transfer_out' ? event.shares : 0n,
+      totalSharesHeld: event.type === 'deposit' ? event.shares 
+        : event.type === 'withdraw' ? -event.shares 
+        : event.type === 'transfer_in' ? event.shares
+        : event.type === 'transfer_out' ? -event.shares
+        : 0n,
+      totalAssetsInvested: event.type === 'deposit' ? event.assets : 0n,
+      totalAssetsWithdrawn: event.type === 'withdraw' ? event.assets : 0n,
+      totalSharesDeposited: event.type === 'deposit' ? event.shares : 0n,
+      totalSharesWithdrawn: event.type === 'withdraw' ? event.shares : 0n,
     };
 
     return { ...positions, [user]: updatedPosition };
@@ -215,10 +225,12 @@ const getContractDeploymentBlock = async (client: PublicClient, contractAddress:
   }
 };
 
-const fetchVaultInfo = async (client: PublicClient, vaultAddress: string): Promise<VaultInfo> => {
+const fetchVaultInfo = async (client: PublicClient, vaultAddress: string): Promise<VaultInfo & { totalAssets?: bigint, totalSupply?: bigint }> => {
   const erc4626Abi = parseAbi([
     'function decimals() view returns (uint8)',
     'function asset() view returns (address)',
+    'function totalAssets() view returns (uint256)',
+    'function totalSupply() view returns (uint256)',
   ]);
 
   const erc20Abi = parseAbi([
@@ -226,7 +238,7 @@ const fetchVaultInfo = async (client: PublicClient, vaultAddress: string): Promi
     'function symbol() view returns (string)',
   ]);
 
-  const [decimals, assetAddress] = await Promise.all([
+  const [decimals, assetAddress, totalAssets, totalSupply] = await Promise.all([
     client.readContract({
       address: vaultAddress as `0x${string}`,
       abi: erc4626Abi,
@@ -237,6 +249,16 @@ const fetchVaultInfo = async (client: PublicClient, vaultAddress: string): Promi
       abi: erc4626Abi,
       functionName: 'asset',
     }),
+    client.readContract({
+      address: vaultAddress as `0x${string}`,
+      abi: erc4626Abi,
+      functionName: 'totalAssets',
+    }).catch(() => undefined),
+    client.readContract({
+      address: vaultAddress as `0x${string}`,
+      abi: erc4626Abi,
+      functionName: 'totalSupply',
+    }).catch(() => undefined),
   ]);
 
   const [assetDecimals, assetSymbol] = await Promise.all([
@@ -252,7 +274,7 @@ const fetchVaultInfo = async (client: PublicClient, vaultAddress: string): Promi
     }),
   ]);
 
-  return { decimals, assetAddress, assetDecimals, assetSymbol };
+  return { decimals, assetAddress, assetDecimals, assetSymbol, totalAssets, totalSupply };
 };
 
 const fetchVaultEvents = async (
@@ -487,12 +509,19 @@ const fetchVaultEvents = async (
     const userLower = userAddress.toLowerCase();
     const zeroAddress = '0x0000000000000000000000000000000000000000';
     
+    // Create a Set of deposit transaction hashes to avoid double-counting
+    const depositTxHashes = new Set(uniqueDepositLogs.map(log => log.transactionHash));
+    
     const relevantTransfers = uniqueTransferLogs.filter(log => {
       const from = log.args.from!.toLowerCase();
       const to = log.args.to!.toLowerCase();
       
-      return (to === userLower && from !== zeroAddress && from !== userLower) ||
-             (from === userLower && to !== zeroAddress && to !== userLower);
+      // Include transfers to user (including mints if not part of deposits) and transfers from user (excluding burns)
+      // Exclude mints that are part of deposit transactions to avoid double-counting
+      const isMintInDeposit = from === zeroAddress && depositTxHashes.has(log.transactionHash);
+      
+      return ((to === userLower && from !== userLower && !isMintInDeposit) ||
+              (from === userLower && to !== zeroAddress && to !== userLower));
     });
 
     const transferEvents = relevantTransfers.map(log => {
@@ -514,14 +543,43 @@ const fetchVaultEvents = async (
     const zeroAddress = '0x0000000000000000000000000000000000000000';
     const vaultLower = vaultAddress.toLowerCase();
     
+    // Create Sets of transaction hashes to avoid double-counting
+    const depositTxHashes = new Set(uniqueDepositLogs.map(log => log.transactionHash));
+    const withdrawTxHashes = new Set(uniqueWithdrawLogs.map(log => log.transactionHash));
+    
+    // Separate mints (from 0x0) from regular transfers
+    // Exclude mints that are part of deposit transactions (to avoid double-counting)
+    const mintTransfers = uniqueTransferLogs.filter(log => {
+      const from = log.args.from!.toLowerCase();
+      const to = log.args.to!.toLowerCase();
+      
+      // Mints: from zero address to user (not vault) AND not part of a deposit transaction
+      return from === zeroAddress && to !== zeroAddress && to !== vaultLower &&
+             !depositTxHashes.has(log.transactionHash);
+    });
+    
     const userTransfers = uniqueTransferLogs.filter(log => {
       const from = log.args.from!.toLowerCase();
       const to = log.args.to!.toLowerCase();
       
+      // Regular transfers: not from/to zero, not from/to vault, not self-transfers
+      // Burns (to zero) are filtered out as they're handled by Withdraw events
       return from !== zeroAddress && to !== zeroAddress && 
              from !== vaultLower && to !== vaultLower &&
              from !== to;
     });
+
+    // Handle mints as transfer_in events
+    const mintEvents = mintTransfers.map(log => ({
+      type: 'transfer_in' as const,
+      blockNumber: log.blockNumber!,
+      transactionHash: log.transactionHash,
+      user: log.args.to!,
+      assets: 0n,
+      shares: log.args.value!,
+      from: log.args.from!,
+      to: log.args.to!,
+    }));
 
     const transferEvents = userTransfers.flatMap(log => [
       {
@@ -545,8 +603,8 @@ const fetchVaultEvents = async (
         to: log.args.to!,
       }
     ]);
-
-    events.push(...transferEvents);
+    
+    events.push(...mintEvents, ...transferEvents);
   }
 
   return { events: sortEventsByBlock(events), deploymentTimestamp: deploymentInfo?.timestamp };
@@ -686,6 +744,12 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
   if (!exportJson) {
     console.log(`Vault decimals: ${vaultInfo.decimals}`);
     console.log(`Asset: ${vaultInfo.assetAddress} (${vaultInfo.assetSymbol})`);
+    if (vaultInfo.totalAssets !== undefined) {
+      console.log(`Vault Total Assets: ${formatUnits(vaultInfo.totalAssets, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol}`);
+    }
+    if (vaultInfo.totalSupply !== undefined) {
+      console.log(`Vault Total Supply: ${formatUnits(vaultInfo.totalSupply, vaultInfo.decimals)} shares`);
+    }
     console.log('---\n');
   }
 
@@ -711,9 +775,82 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
     console.log(`\n=== Event Summary ===`);
     console.log(`Deposits: ${eventCounts.deposits}`);
     console.log(`Withdrawals: ${eventCounts.withdrawals}`);
-    console.log(`Transfers In: ${eventCounts.transfersIn}`);
-    console.log(`Transfers Out: ${eventCounts.transfersOut}`);
-    console.log(`Total Events: ${enrichedEvents.length}`);
+    console.log(`Total Events (excl. transfers): ${eventCounts.deposits + eventCounts.withdrawals}`);
+    
+    // Show transfer information separately
+    if (eventCounts.transfersIn > 0 || eventCounts.transfersOut > 0) {
+      console.log('\n=== Transfer Activity (Informational Only) ===');
+      console.log(`Transfers tracked: ${eventCounts.transfersIn} in, ${eventCounts.transfersOut} out`);
+      console.log('Note: Transfers between users do not affect vault totals or PnL calculations');
+      
+      // Find top transfer recipients
+      const transferRecipients: Record<string, { count: number, shares: bigint }> = {};
+      enrichedEvents
+        .filter(e => e.type === 'transfer_in')
+        .forEach(e => {
+          const user = e.user.toLowerCase();
+          if (!transferRecipients[user]) {
+            transferRecipients[user] = { count: 0, shares: 0n };
+          }
+          transferRecipients[user].count++;
+          transferRecipients[user].shares += e.shares;
+        });
+      
+      const topRecipients = Object.entries(transferRecipients)
+        .sort((a, b) => Number(b[1].shares - a[1].shares))
+        .slice(0, 3);
+      
+      if (topRecipients.length > 0) {
+        console.log('\nTop transfer recipients (likely staking contracts):');
+        topRecipients.forEach(([addr, data]) => {
+          const sharesFormatted = formatUnits(data.shares, vaultInfo.decimals);
+          console.log(`  ${addr.slice(0, 10)}...: ${data.count} transfers, ${parseFloat(sharesFormatted).toFixed(2)} shares`);
+        });
+      }
+    }
+  }
+  
+  // Validate total supply if available
+  if (vaultInfo.totalSupply !== undefined && !exportJson && !userAddress) {
+    const calculatedTotalShares = Object.values(positions).reduce((sum, pos) => sum + pos.totalSharesHeld, 0n);
+    const supplyDiff = vaultInfo.totalSupply - calculatedTotalShares;
+    
+    // Debug: Check for negative shares
+    const negativeSharePositions = Object.values(positions).filter(pos => pos.totalSharesHeld < 0n);
+    const totalDepositsShares = Object.values(positions).reduce((sum, pos) => sum + pos.totalSharesDeposited, 0n);
+    const totalWithdrawalsShares = Object.values(positions).reduce((sum, pos) => sum + pos.totalSharesWithdrawn, 0n);
+    
+    console.log(`\n=== Supply Validation ===`);
+    console.log(`Vault Total Supply: ${formatUnits(vaultInfo.totalSupply, vaultInfo.decimals)} shares`);
+    console.log(`Calculated Total Shares: ${formatUnits(calculatedTotalShares, vaultInfo.decimals)} shares`);
+    console.log(`Total Deposited Shares: ${formatUnits(totalDepositsShares, vaultInfo.decimals)} shares`);
+    console.log(`Total Withdrawn Shares: ${formatUnits(totalWithdrawalsShares, vaultInfo.decimals)} shares`);
+    console.log(`Net (Deposits - Withdrawals): ${formatUnits(totalDepositsShares - totalWithdrawalsShares, vaultInfo.decimals)} shares`);
+    if (negativeSharePositions.length > 0) {
+      console.log(`⚠️  Users with negative calculated shares: ${negativeSharePositions.length}`);
+      const totalNegativeShares = negativeSharePositions.reduce((sum, pos) => sum + pos.totalSharesHeld, 0n);
+      console.log(`   Total negative shares: ${formatUnits(totalNegativeShares, vaultInfo.decimals)} shares`);
+      console.log(`   Note: These users likely received initial shares at vault deployment`);
+      console.log(`         or through mechanisms not captured by standard events.`);
+      console.log(`\n   Addresses with negative shares:`);
+      negativeSharePositions
+        .sort((a, b) => Number(a.totalSharesHeld - b.totalSharesHeld))
+        .forEach(pos => {
+          console.log(`     ${pos.user}: ${formatUnits(pos.totalSharesHeld, vaultInfo.decimals)} shares`);
+        });
+    }
+    
+    if (supplyDiff !== 0n) {
+      const supplyDiffAbs = supplyDiff < 0n ? -supplyDiff : supplyDiff;
+      if (supplyDiffAbs > 1000000000000000n) { // More than 0.001 shares
+        console.warn(`⚠️  Difference: ${formatUnits(supplyDiff, vaultInfo.decimals)} shares`);
+        console.warn(`   This may indicate missing events or calculation errors.`);
+      } else {
+        console.log(`✓ Difference: ${formatUnits(supplyDiff, vaultInfo.decimals)} shares (negligible)`);
+      }
+    } else {
+      console.log(`✓ Perfect match!`);
+    }
   }
 
   const currentValues = await getCurrentShareValues(client, vaultAddress, positions);
@@ -760,7 +897,12 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
     if (eventCounts.transfersIn !== eventCounts.transfersOut) {
       console.warn(`⚠️  WARNING: Transfer imbalance detected!`);
       console.warn(`   Transfers In: ${eventCounts.transfersIn}, Transfers Out: ${eventCounts.transfersOut}`);
-      console.warn(`   This should not happen in a properly functioning vault\n`);
+      if (eventCounts.transfersOut > eventCounts.transfersIn) {
+        console.warn(`   Some users likely received initial shares at vault deployment`);
+        console.warn(`   or through mechanisms not captured by standard ERC-4626 events.\n`);
+      } else {
+        console.warn(`   This may indicate missing events or non-standard share minting.\n`);
+      }
     }
   }
   
@@ -828,11 +970,30 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
     });
 
     const totalNetInvested = totals.totalDeposited - totals.totalWithdrawn;
-    const totalCurrentValue = Object.values(currentValues).reduce((sum, val) => sum + val, 0n);
-    const totalValue = totalCurrentValue + totals.totalWithdrawn;
-    const totalPnlPercentage = totals.totalDeposited > 0n
-      ? (exactToSimple(totals.pnl, vaultInfo.assetDecimals) / exactToSimple(totals.totalDeposited, vaultInfo.assetDecimals)) * 100
+    
+    // Use vault's totalAssets if available, otherwise calculate from shares
+    const totalCurrentValue = vaultInfo.totalAssets !== undefined 
+      ? vaultInfo.totalAssets
+      : Object.values(currentValues).reduce((sum, val) => sum + val, 0n);
+    
+    // Recalculate PnL using actual vault value
+    const actualTotalPnl = totalCurrentValue - totalNetInvested;
+    const actualTotalValue = totalCurrentValue + totals.totalWithdrawn;
+    
+    const totalPnlPercentage = totalNetInvested > 0n
+      ? (exactToSimple(actualTotalPnl, vaultInfo.assetDecimals) / exactToSimple(totalNetInvested, vaultInfo.assetDecimals)) * 100
       : 0;
+    
+    // If using vault's totalAssets, show the difference from calculated value
+    if (vaultInfo.totalAssets !== undefined && !exportJson) {
+      const calculatedValue = Object.values(currentValues).reduce((sum, val) => sum + val, 0n);
+      const valueDiff = vaultInfo.totalAssets - calculatedValue;
+      if (valueDiff !== 0n) {
+        console.log(`\n⚠️  Note: Using vault's actual totalAssets (${formatUnits(vaultInfo.totalAssets, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol})`);
+        console.log(`   vs calculated from shares (${formatUnits(calculatedValue, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol})`);
+        console.log(`   Difference: ${formatUnits(valueDiff, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol}\n`);
+      }
+    }
 
     // Calculate APR for vault total
     if (deploymentTimestamp && totalPnlPercentage !== 0) {
@@ -848,13 +1009,25 @@ const calculateVaultPnL = async (vaultAddress: string, userAddress?: string, exp
     }
     
     if (!exportJson) {
-      console.log(formatVaultSummaryForConsole(results, totals, totalNetInvested, totalCurrentValue, totalValue, totalPnlPercentage, vaultInfo, annualizedReturn));
+      // Use the recalculated totals with actual vault value
+      const actualTotals = {
+        ...totals,
+        pnl: actualTotalPnl,
+      };
+      console.log(formatVaultSummaryForConsole(results, actualTotals, totalNetInvested, totalCurrentValue, actualTotalValue, totalPnlPercentage, vaultInfo, annualizedReturn));
 
       const sortedByPnl = [...results].sort((a, b) => exactToSimple(b.pnl, vaultInfo.assetDecimals) - exactToSimple(a.pnl, vaultInfo.assetDecimals));
       console.log(formatTopMoversForConsole('Top 5 Gainers', sortedByPnl.slice(0, 5), vaultInfo));
-      console.log(formatTopMoversForConsole('Top 5 Losers', sortedByPnl.slice(-5).reverse(), vaultInfo));
     } else {
-      jsonExport.summary = formatSummaryForJson(totals, totalNetInvested, totalCurrentValue, totalValue, totalPnlPercentage, vaultInfo, results.length);
+      jsonExport.summary = formatSummaryForJson(
+        { ...totals, pnl: actualTotalPnl }, 
+        totalNetInvested, 
+        totalCurrentValue, 
+        actualTotalValue, 
+        totalPnlPercentage, 
+        vaultInfo, 
+        results.length
+      );
       jsonExport.users = results.map(result => formatPnLForJson(result, vaultInfo));
     }
   }
