@@ -102,18 +102,10 @@ export const formatEventForConsole = (
 ): string => {
   let details = `Event #${index + 1} (${event.type}):
   Block: ${event.blockNumber}
-  Transaction: ${event.transactionHash}`;
-
-  if (event.type === 'transfer_in' || event.type === 'transfer_out') {
-    details += `
-  From: ${event.from}
-  To: ${event.to}`;
-  }
-
-  details += `
+  Transaction: ${event.transactionHash}
   Assets: ${formatUnits(event.assets, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol}
   Shares: ${formatUnits(event.shares, vaultInfo.decimals)}
-  Price per share: ${formatUnits(event.pricePerShare!, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol}
+  Price per share: ${formatUnits(event.pricePerShare!, 1)} ${vaultInfo.assetSymbol}
 ---`;
 
   return details;

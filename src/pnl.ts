@@ -1,6 +1,64 @@
 import { parseAbi, type PublicClient } from 'viem';
 import { UserPosition, PnLResult } from '../types';
 import { exactToSimple } from '../helper';
+import { add, subtract, multiply, divide, safeRatio, isPositive, ZERO } from './utils/bigint';
+
+const calculateCostBasis = (
+  totalInvested: bigint,
+  sharesForCost: bigint,
+  totalShares: bigint
+): bigint => {
+  if (sharesForCost === ZERO || totalShares === ZERO) return ZERO;
+  return divide(multiply(totalInvested, sharesForCost), totalShares);
+};
+
+const calculateAvgPrice = (
+  totalAssets: bigint,
+  totalShares: bigint,
+  assetDecimals: number,
+  vaultDecimals: number
+): number => {
+  if (totalShares === ZERO) return 0;
+  return exactToSimple(totalAssets, assetDecimals) / exactToSimple(totalShares, vaultDecimals);
+};
+
+const calculatePnlPercentage = (
+  pnl: bigint,
+  totalInvested: bigint,
+  assetDecimals: number
+): number => {
+  if (totalInvested === ZERO) return 0;
+  return (exactToSimple(pnl, assetDecimals) / exactToSimple(totalInvested, assetDecimals)) * 100;
+};
+
+interface PnLComponents {
+  realizedPnL: bigint;
+  unrealizedPnL: bigint;
+  totalPnL: bigint;
+}
+
+const calculatePnLComponents = (
+  position: UserPosition,
+  currentValue: bigint
+): PnLComponents => {
+  const costBasisWithdrawn = calculateCostBasis(
+    position.totalAssetsInvested,
+    position.totalSharesWithdrawn,
+    position.totalSharesDeposited
+  );
+
+  const costBasisRemaining = calculateCostBasis(
+    position.totalAssetsInvested,
+    position.totalSharesHeld,
+    position.totalSharesDeposited
+  );
+
+  const realizedPnL = subtract(position.totalAssetsWithdrawn, costBasisWithdrawn);
+  const unrealizedPnL = subtract(currentValue, costBasisRemaining);
+  const totalPnL = add(realizedPnL, unrealizedPnL);
+
+  return { realizedPnL, unrealizedPnL, totalPnL };
+};
 
 export const calculatePnL = (
   position: UserPosition,
@@ -8,28 +66,23 @@ export const calculatePnL = (
   assetDecimals: number,
   vaultDecimals: number
 ): PnLResult => {
-  const netInvested = position.totalAssetsInvested - position.totalAssetsWithdrawn;
-  const totalValue = currentValue + position.totalAssetsWithdrawn;
+  const netInvested = subtract(position.totalAssetsInvested, position.totalAssetsWithdrawn);
+  const totalValue = add(currentValue, position.totalAssetsWithdrawn);
 
-  const avgDepositPrice = position.totalSharesDeposited > 0n
-    ? exactToSimple(position.totalAssetsInvested, assetDecimals) / exactToSimple(position.totalSharesDeposited, vaultDecimals)
-    : 0;
+  const avgDepositPrice = calculateAvgPrice(
+    position.totalAssetsInvested,
+    position.totalSharesDeposited,
+    assetDecimals,
+    vaultDecimals
+  );
 
-  const costBasisOfWithdrawnShares = position.totalSharesWithdrawn > 0n && position.totalSharesDeposited > 0n
-    ? position.totalAssetsInvested * position.totalSharesWithdrawn / position.totalSharesDeposited
-    : 0n;
-  const realizedPnL = position.totalAssetsWithdrawn - costBasisOfWithdrawnShares;
+  const { realizedPnL, unrealizedPnL, totalPnL } = calculatePnLComponents(position, currentValue);
 
-  const costBasisOfRemainingShares = position.totalSharesHeld > 0n && position.totalSharesDeposited > 0n
-    ? position.totalAssetsInvested * position.totalSharesHeld / position.totalSharesDeposited
-    : 0n;
-  const unrealizedPnL = currentValue - costBasisOfRemainingShares;
-  
-  const calculatedPnl = realizedPnL + unrealizedPnL;
-  
-  const pnlPercentage = position.totalAssetsInvested > 0n
-    ? (exactToSimple(calculatedPnl, assetDecimals) / exactToSimple(position.totalAssetsInvested, assetDecimals)) * 100
-    : 0;
+  const pnlPercentage = calculatePnlPercentage(
+    totalPnL,
+    position.totalAssetsInvested,
+    assetDecimals
+  );
 
   return {
     user: position.user,
@@ -39,11 +92,21 @@ export const calculatePnL = (
     currentShares: position.totalSharesHeld,
     currentValue,
     totalValue,
-    pnl: calculatedPnl,
+    pnl: totalPnL,
     pnlPercentage,
     realizedPnL,
     unrealizedPnL,
     avgDepositPrice,
+  };
+};
+
+const partitionPositions = (
+  positions: Record<string, UserPosition>
+): { withShares: Array<[string, UserPosition]>; withoutShares: Array<[string, UserPosition]> } => {
+  const entries = Object.entries(positions);
+  return {
+    withShares: entries.filter(([_, position]) => isPositive(position.totalSharesHeld)),
+    withoutShares: entries.filter(([_, position]) => !isPositive(position.totalSharesHeld)),
   };
 };
 
@@ -56,23 +119,20 @@ export const getCurrentShareValues = async (
     'function convertToAssets(uint256 shares) view returns (uint256)',
   ]);
 
-  const positionEntries = Object.entries(positions);
-  const positionsWithShares = positionEntries.filter(([_, position]) => position.totalSharesHeld > 0n);
-  const positionsWithoutShares = positionEntries.filter(([_, position]) => position.totalSharesHeld <= 0n);
+  const { withShares, withoutShares } = partitionPositions(positions);
 
-  const initialValues = positionsWithoutShares.reduce(
-    (acc, [user]) => ({ ...acc, [user]: 0n }),
-    {} as Record<string, bigint>
+  const zeroValues = Object.fromEntries(
+    withoutShares.map(([user]) => [user, ZERO])
   );
 
-  if (positionsWithShares.length === 0) {
-    return initialValues;
+  if (withShares.length === 0) {
+    return zeroValues;
   }
 
-  const contracts = positionsWithShares.map(([_, position]) => ({
+  const contracts = withShares.map(([_, position]) => ({
     address: vaultAddress as `0x${string}`,
     abi: erc4626Abi,
-    functionName: 'convertToAssets',
+    functionName: 'convertToAssets' as const,
     args: [position.totalSharesHeld],
   }));
 
@@ -81,10 +141,9 @@ export const getCurrentShareValues = async (
     allowFailure: false,
   });
 
-  const shareValues = positionsWithShares.reduce(
-    (acc, [user], index) => ({ ...acc, [user]: results[index] }),
-    {} as Record<string, bigint>
+  const shareValues = Object.fromEntries(
+    withShares.map(([user], index) => [user, results[index]])
   );
 
-  return { ...initialValues, ...shareValues };
+  return { ...zeroValues, ...shareValues };
 };
