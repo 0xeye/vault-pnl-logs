@@ -54,11 +54,12 @@ export const calculateVaultPnL = async (
     printVaultInfo(vaultInfo)
   }
 
-  const rawEvents = await fetchVaultEvents(client, vaultAddress, userAddress)
-  const events = rawEvents.map((event) => ({
-    ...event,
-    pricePerShare: divide(event.assets, event.shares),
-  }))
+  const events = await fetchVaultEvents(client, vaultAddress, userAddress).then((events) =>
+    events.map((event) => ({
+      ...event,
+      pricePerShare: divide(event.assets, event.shares),
+    })),
+  )
 
   const positions = aggregateUserPositions(events)
   const currentValues = await getCurrentShareValues(client, vaultAddress, positions)
