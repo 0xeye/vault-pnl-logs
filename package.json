@@ -15,9 +15,7 @@
   "keywords": [],
   "license": "ISC",
   "scripts": {
-    "calculate-pnl": "bun run src/index.ts",
     "asset-growth": "bun run src/assetGrowth.ts",
-    "analyze-transfers": "bun run src/transferAnalysis.ts",
     "transfer-pnl": "bun run src/transferPnl.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   }

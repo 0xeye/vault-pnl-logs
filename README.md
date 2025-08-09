@@ -1,11 +1,14 @@
-# Yearn Vault PnL Calculator
+# Vault Analytics Tools
 
-Calculate profit and loss (PnL) for ERC-4626 vault deposits and withdrawals on the Katana network.
+Analyze ERC-4626 vault performance on the Katana network with transfer-based PnL calculations and asset growth tracking.
 
 ## Overview
 
-Analyzes ERC-4626 vault transactions to calculate user profit/loss by reading deposit, withdraw, and transfer events. Handles shares acquired through migration phase (transfer). Computes realized and unrealized gains using historical prices. Supports individual user or vault-wide analysis with JSON export.
+This toolkit provides two main analytics scripts:
 
+- **Transfer PnL**: Calculates profit and loss for vault token holders by analyzing all ERC20 transfers, including mints, burns, and bridge transfers. Uses FIFO accounting to track cost basis and compute realized/unrealized gains.
+
+- **Asset Growth**: Tracks vault asset growth over time by monitoring the vault's total asset value and calculating APY based on historical data.
 
 ## Configuration
 
@@ -17,44 +20,52 @@ KATANA_RPC_URL=https://your-rpc-url-here
 
 ## Usage
 
-### Single User PnL
+### Transfer PnL Analysis
 
-Calculate PnL for a specific user in a vault:
+Calculate PnL for all token holders based on transfer history:
 
 ```bash
-bun run calculate-pnl <vault-address> <user-address>
+npm run transfer-pnl <token-address>
 
 # Example
-bun run calculate-pnl 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37 0x2086a811182F83a023c4dA3dD9d2E5539B2d43C9
+npm run transfer-pnl 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37
 ```
 
-### Vault-Wide PnL
+### Asset Growth Tracking
 
-Calculate PnL for all users in a vault:
+Monitor vault asset growth and calculate APY:
 
 ```bash
-bun run calculate-pnl <vault-address>
+npm run asset-growth <vault-address>
 
 # Example
-bun run calculate-pnl 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37
+npm run asset-growth 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37
 ```
 
 ### JSON Export
 
-Add the `--json` flag to export results as JSON:
+Both scripts support JSON export for programmatic use:
 
 ```bash
-# Single user
-bun run calculate-pnl <vault-address> <user-address> --json
-
-# All users
-bun run calculate-pnl <vault-address> --json
+npm run transfer-pnl <token-address> --json
+npm run asset-growth <vault-address> --json
 ```
 
-JSON files are saved to the `data/` directory with descriptive names:
-- Single user: `<user-address>-<vault-address>.json`
-- All users: `<vault-address>.json`
+## Technical Details
 
+### Transfer PnL Methodology
+
+- **Mints**: Tokens created from 0x0000...0000 (excluding mints to bridge)
+- **Burns**: Tokens sent to 0x0000...0000
+- **Bridge Mints**: Transfers from 0x5480F3152748809495Bd56C14eaB4A622aA3A19b
+- **Cost Basis**: FIFO (First In, First Out) accounting
+- **Price**: Uses current vault share price for all calculations
+
+### Asset Growth Methodology
+
+- Reads `totalAssets()` from ERC-4626 vault contract
+- Samples asset values at regular block intervals
+- Calculates APY based on growth rate over time period
 
 ## License
 
