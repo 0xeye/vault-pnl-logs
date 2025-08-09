@@ -1,5 +1,5 @@
 export interface VaultEvent {
-  type: 'deposit' | 'withdraw';
+  type: 'deposit' | 'withdraw' | 'migration';
   blockNumber: bigint;
   transactionHash: string;
   user: string;
@@ -22,6 +22,7 @@ export interface UserPosition {
   totalAssetsWithdrawn: bigint;
   totalSharesDeposited: bigint;
   totalSharesWithdrawn: bigint;
+  totalSharesMigrated: bigint;
   events: VaultEvent[];
 }
 

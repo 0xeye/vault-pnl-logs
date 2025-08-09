@@ -1,6 +1,7 @@
 import { type Log, type PublicClient, parseAbiItem } from 'viem'
 import { VaultEvent } from '../types'
 import { divide } from './utils/bigint'
+import { createMigrationEvents } from './migrations'
 
 const DEPOSIT_EVENT =
   'event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)'
@@ -40,6 +41,7 @@ export const fetchVaultEvents = async (
   client: PublicClient,
   vaultAddress: string,
   userAddress?: string,
+  vaultDecimals?: number,
 ): Promise<VaultEvent[]> => {
   const ownerArg = userAddress ? { owner: userAddress as `0x${string}` } : undefined
 
@@ -52,6 +54,16 @@ export const fetchVaultEvents = async (
     ...depositLogs.map((log) => createVaultEvent('deposit', log)),
     ...withdrawLogs.map((log) => createVaultEvent('withdraw', log)),
   ]
+
+  // Add migration events if vault decimals are provided
+  if (vaultDecimals !== undefined) {
+    const migrationEvents = createMigrationEvents(vaultAddress, vaultDecimals);
+    // If analyzing a specific user, only include their migrations
+    const relevantMigrations = userAddress 
+      ? migrationEvents.filter(e => e.user.toLowerCase() === userAddress.toLowerCase())
+      : migrationEvents;
+    events.push(...relevantMigrations);
+  }
 
   return sortEventsByBlock(events)
 }

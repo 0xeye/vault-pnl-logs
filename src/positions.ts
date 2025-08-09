@@ -2,6 +2,7 @@ import { VaultEvent, UserPosition } from '../types';
 import { add, subtract, ZERO } from './utils/bigint';
 
 const isDeposit = (type: VaultEvent['type']): boolean => type === 'deposit';
+const isMigration = (type: VaultEvent['type']): boolean => type === 'migration';
 
 interface PositionUpdate {
   shares: bigint;
@@ -16,14 +17,18 @@ const createInitialPosition = (user: string, event: VaultEvent): UserPosition =>
     isDeposit: isDeposit(event.type),
   };
 
+  const isMig = isMigration(event.type);
+  const isWithdraw = event.type === 'withdraw';
+
   return {
     user,
     events: [event],
-    totalSharesHeld: update.isDeposit ? update.shares : -update.shares,
+    totalSharesHeld: isWithdraw ? -update.shares : update.shares,
     totalAssetsInvested: update.isDeposit ? update.assets : ZERO,
-    totalAssetsWithdrawn: !update.isDeposit ? update.assets : ZERO,
+    totalAssetsWithdrawn: isWithdraw ? update.assets : ZERO,
     totalSharesDeposited: update.isDeposit ? update.shares : ZERO,
-    totalSharesWithdrawn: !update.isDeposit ? update.shares : ZERO,
+    totalSharesWithdrawn: isWithdraw ? update.shares : ZERO,
+    totalSharesMigrated: isMig ? update.shares : ZERO,
   };
 };
 
@@ -37,24 +42,30 @@ const updateExistingPosition = (
     isDeposit: isDeposit(event.type),
   };
 
+  const isMig = isMigration(event.type);
+  const isWithdraw = event.type === 'withdraw';
+
   return {
     ...position,
     events: [...position.events, event],
-    totalSharesHeld: update.isDeposit
-      ? add(position.totalSharesHeld, update.shares)
-      : subtract(position.totalSharesHeld, update.shares),
+    totalSharesHeld: isWithdraw
+      ? subtract(position.totalSharesHeld, update.shares)
+      : add(position.totalSharesHeld, update.shares),
     totalAssetsInvested: update.isDeposit
       ? add(position.totalAssetsInvested, update.assets)
       : position.totalAssetsInvested,
-    totalAssetsWithdrawn: !update.isDeposit
+    totalAssetsWithdrawn: isWithdraw
       ? add(position.totalAssetsWithdrawn, update.assets)
       : position.totalAssetsWithdrawn,
     totalSharesDeposited: update.isDeposit
       ? add(position.totalSharesDeposited, update.shares)
       : position.totalSharesDeposited,
-    totalSharesWithdrawn: !update.isDeposit
+    totalSharesWithdrawn: isWithdraw
       ? add(position.totalSharesWithdrawn, update.shares)
       : position.totalSharesWithdrawn,
+    totalSharesMigrated: isMig
+      ? add(position.totalSharesMigrated, update.shares)
+      : position.totalSharesMigrated,
   };
 };
 

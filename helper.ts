@@ -100,12 +100,13 @@ export const formatEventForConsole = (
   index: number,
   vaultInfo: VaultInfo
 ): string => {
-  const details = `Event #${index + 1} (${event.type}):
+  const typeLabel = event.type === 'migration' ? 'migration (from pre-deposit vault)' : event.type;
+  const details = `Event #${index + 1} (${typeLabel}):
   Block: ${event.blockNumber}
   Transaction: ${event.transactionHash}
   Assets: ${formatUnits(event.assets, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol}
   Shares: ${formatUnits(event.shares, vaultInfo.decimals)}
-  Price per share: ${formatUnits(event.pricePerShare!, 1)} ${vaultInfo.assetSymbol}
+  Price per share: ${event.pricePerShare ? formatUnits(event.pricePerShare, 1) : '1.0'} ${vaultInfo.assetSymbol}
 ---`;
 
   return details;

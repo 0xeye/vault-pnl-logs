@@ -54,10 +54,10 @@ export const calculateVaultPnL = async (
     printVaultInfo(vaultInfo)
   }
 
-  const events = await fetchVaultEvents(client, vaultAddress, userAddress).then((events) =>
+  const events = await fetchVaultEvents(client, vaultAddress, userAddress, vaultInfo.decimals).then((events) =>
     events.map((event) => ({
       ...event,
-      pricePerShare: divide(event.assets, event.shares),
+      pricePerShare: event.shares > 0n ? divide(event.assets, event.shares) : 0n,
     })),
   )
 

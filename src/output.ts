@@ -33,8 +33,14 @@ export const printUserEvents = (
 ): void => {
   const deposits = position.events.filter(e => e.type === 'deposit').length;
   const withdrawals = position.events.filter(e => e.type === 'withdraw').length;
+  const migrations = position.events.filter(e => e.type === 'migration').length;
 
-  console.log(`Found ${deposits} deposits, ${withdrawals} withdrawals\n`);
+  const eventSummary = [`${deposits} deposits`, `${withdrawals} withdrawals`];
+  if (migrations > 0) {
+    eventSummary.unshift(`${migrations} migrations`);
+  }
+  
+  console.log(`Found ${eventSummary.join(', ')}\n`);
 
   position.events.forEach((event, index) =>
     console.log(formatEventForConsole(event, index, vaultInfo))
