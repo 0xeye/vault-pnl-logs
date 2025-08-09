@@ -1,0 +1,69 @@
+import { type Log, type PublicClient, parseAbiItem } from 'viem'
+import { VaultEvent } from '../types'
+import { divide } from './utils/bigint'
+import { createMigrationEvents } from './migrations'
+
+const DEPOSIT_EVENT =
+  'event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)'
+const WITHDRAW_EVENT =
+  'event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)'
+
+type EventType = 'deposit' | 'withdraw'
+
+const createVaultEvent = (type: EventType, log: Log<bigint, number, false>): VaultEvent => ({
+  type,
+  blockNumber: log.blockNumber!,
+  transactionHash: log.transactionHash,
+  user: (log as any).args.owner!,
+  assets: (log as any).args.assets!,
+  shares: (log as any).args.shares!,
+})
+
+const fetchLogs = async (
+  client: PublicClient,
+  vaultAddress: string,
+  eventAbi: ReturnType<typeof parseAbiItem>,
+  args?: any,
+) => {
+  return client.getLogs({
+    address: vaultAddress as `0x${string}`,
+    event: eventAbi,
+    fromBlock: 'earliest',
+    toBlock: 'latest',
+    args,
+  })
+}
+
+export const sortEventsByBlock = (events: VaultEvent[]): VaultEvent[] =>
+  [...events].sort((a, b) => Number(a.blockNumber) - Number(b.blockNumber))
+
+export const fetchVaultEvents = async (
+  client: PublicClient,
+  vaultAddress: string,
+  userAddress?: string,
+  vaultDecimals?: number,
+): Promise<VaultEvent[]> => {
+  const ownerArg = userAddress ? { owner: userAddress as `0x${string}` } : undefined
+
+  const [depositLogs, withdrawLogs] = await Promise.all([
+    fetchLogs(client, vaultAddress, parseAbiItem(DEPOSIT_EVENT), ownerArg),
+    fetchLogs(client, vaultAddress, parseAbiItem(WITHDRAW_EVENT), ownerArg),
+  ])
+
+  const events: VaultEvent[] = [
+    ...depositLogs.map((log) => createVaultEvent('deposit', log)),
+    ...withdrawLogs.map((log) => createVaultEvent('withdraw', log)),
+  ]
+
+  // Add migration events if vault decimals are provided
+  if (vaultDecimals !== undefined) {
+    const migrationEvents = createMigrationEvents(vaultAddress, vaultDecimals);
+    // If analyzing a specific user, only include their migrations
+    const relevantMigrations = userAddress 
+      ? migrationEvents.filter(e => e.user.toLowerCase() === userAddress.toLowerCase())
+      : migrationEvents;
+    events.push(...relevantMigrations);
+  }
+
+  return sortEventsByBlock(events)
+}
