@@ -17,22 +17,11 @@ This toolkit provides two main analytics scripts:
 Create a `.env` file to override default RPC URLs:
 
 ```env
-# Custom RPC URLs (optional - defaults are provided)
-ETHEREUM_RPC_URL=https://your-ethereum-rpc
-BASE_RPC_URL=https://your-base-rpc
-OPTIMISM_RPC_URL=https://your-optimism-rpc
-ARBITRUM_RPC_URL=https://your-arbitrum-rpc
-POLYGON_RPC_URL=https://your-polygon-rpc
 KATANA_RPC_URL=https://your-katana-rpc  # Required for Katana
 ```
 
 ### Supported Chains
 
-- **ethereum** - Ethereum Mainnet (default RPC: llamarpc)
-- **base** - Base L2 (default RPC: llamarpc)
-- **optimism** - Optimism L2 (default RPC: llamarpc)
-- **arbitrum** - Arbitrum One (default RPC: llamarpc)
-- **polygon** - Polygon PoS (default RPC: llamarpc)
 - **katana** - Katana (requires KATANA_RPC_URL env var)
 
 ## Usage

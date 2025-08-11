@@ -1,4 +1,4 @@
-import { createPublicClient, http, parseAbi, formatUnits } from 'viem';
+import { createPublicClient, parseAbi, formatUnits } from 'viem';
 import { loadConfig } from './config';
 import { fetchVaultInfo } from './vault';
 import { createClient } from './client';
@@ -16,7 +16,7 @@ async function findFirstDepositBlock(
   client: ReturnType<typeof createPublicClient>,
   vaultAddress: string
 ): Promise<bigint> {
-  const events = await fetchVaultEvents(client, vaultAddress);
+  const events = await fetchVaultEvents(client as any, vaultAddress);
   const depositEvents = events.filter(e => e.type === 'deposit');
   
   if (depositEvents.length === 0) {
@@ -97,7 +97,6 @@ async function getVaultSnapshot(
 function calculateGrowth(
   initialSnapshot: VaultSnapshot,
   currentSnapshot: VaultSnapshot,
-  decimals: number
 ): {
   assetGrowth: bigint;
   growthRate: number;
@@ -160,7 +159,7 @@ async function main() {
     getVaultSnapshot(client, vaultAddress, toBlock),
   ]);
 
-  const growth = calculateGrowth(initialSnapshot, currentSnapshot, vaultInfo.assetDecimals);
+  const growth = calculateGrowth(initialSnapshot, currentSnapshot);
 
   const [initialBlock, currentBlock] = await Promise.all([
     client.getBlock({ blockNumber: initialSnapshot.blockNumber }),
@@ -198,7 +197,6 @@ async function main() {
   console.log('Growth Metrics:');
   console.log(`  Asset Growth: ${formatUnits(growth.assetGrowth, vaultInfo.assetDecimals)} ${vaultInfo.assetSymbol}`);
   console.log(`  Growth Rate: ${growth.growthPercentage.toFixed(4)}%`);
-  console.log(`  Multiplier: ${(1 + growth.growthRate).toFixed(6)}x`);
   
   if (daysElapsed >= 1) {
     console.log(`  APY: ${annualizedRate.toFixed(2)}%`);
