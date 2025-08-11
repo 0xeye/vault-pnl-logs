@@ -1,4 +1,4 @@
-import { type PublicClient, parseAbiItem, formatUnits, parseAbi } from 'viem'
+import { type PublicClient, parseAbiItem, formatUnits, parseAbi, isAddressEqual } from 'viem'
 import { loadConfig } from './config'
 import { createClient } from './client'
 import { fetchVaultInfo } from './vault'
@@ -54,11 +54,11 @@ interface VaultPnL {
 }
 
 const categorizeTransfer = (from: string, to: string): Transfer['type'] => {
-  if (from.toLowerCase() === ZERO_ADDRESS.toLowerCase()) {
+  if (isAddressEqual(from as `0x${string}`, ZERO_ADDRESS)) {
     return 'mint'
-  } else if (to.toLowerCase() === ZERO_ADDRESS.toLowerCase()) {
+  } else if (isAddressEqual(to as `0x${string}`, ZERO_ADDRESS)) {
     return 'burn'
-  } else if (from.toLowerCase() === BRIDGE_ADDRESS.toLowerCase()) {
+  } else if (isAddressEqual(from as `0x${string}`, BRIDGE_ADDRESS)) {
     return 'bridge_mint'
   }
   return 'transfer'
@@ -177,9 +177,9 @@ const processUserTransfers = (
 
     switch (transfer.type) {
       case 'mint':
-        const mintUser = transfer.to.toLowerCase()
+        const mintUser = transfer.to as `0x${string}`
         // Skip mints to the bridge address to avoid double counting
-        if (mintUser === BRIDGE_ADDRESS.toLowerCase()) {
+        if (isAddressEqual(mintUser , BRIDGE_ADDRESS)) {
           break
         }
         if (!userPnLs[mintUser]) {
@@ -197,7 +197,7 @@ const processUserTransfers = (
         break
         
       case 'bridge_mint':
-        const bridgeMintUser = transfer.to.toLowerCase()
+        const bridgeMintUser = transfer.to as `0x${string}`
         if (!userPnLs[bridgeMintUser]) {
           userPnLs[bridgeMintUser] = createEmptyUserPnL(bridgeMintUser)
         }
@@ -213,15 +213,15 @@ const processUserTransfers = (
         break
 
       case 'burn':
-        const burnUser = transfer.from.toLowerCase()
+        const burnUser = transfer.from as `0x${string}`
         if (userPnLs[burnUser]) {
           processDisposal(userPnLs[burnUser], transfer.value, cost)
         }
         break
 
       case 'transfer':
-        const fromUser = transfer.from.toLowerCase()
-        const toUser = transfer.to.toLowerCase()
+        const fromUser = transfer.from as `0x${string}`
+        const toUser = transfer.to as `0x${string}`
         
         if (userPnLs[fromUser]) {
           processDisposal(userPnLs[fromUser], transfer.value, cost)
@@ -356,7 +356,7 @@ const calculateVaultPnL = (
     switch (transfer.type) {
       case 'mint':
         // Don't count mints to the bridge address
-        if (transfer.to.toLowerCase() !== BRIDGE_ADDRESS.toLowerCase()) {
+        if (!isAddressEqual(transfer.to as `0x${string}`, BRIDGE_ADDRESS)) {
           totalMinted = add(totalMinted, transfer.value)
         }
         break
