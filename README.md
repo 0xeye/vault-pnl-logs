@@ -42,19 +42,22 @@ npm run transfer-pnl 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37
 Monitor vault asset growth and calculate APY:
 
 ```bash
-npm run asset-growth <vault-address>
+# From first deposit to latest block
+npm run asset-growth <address>
 
-# Example
-npm run asset-growth 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37
+# Analyze specific time periods
+npm run asset-growth <address> --period <1m | 1w | 1d | 1y>
+
+# Analyze specific block range
+npm run asset-growth <address> --from-block 1000 --to-block 2000
 ```
 
 ### JSON Export
 
-Both scripts support JSON export for programmatic use:
+Transfer PnL script supports JSON export for programmatic use:
 
 ```bash
 npm run transfer-pnl <token-address> --json
-npm run asset-growth <vault-address> --json
 ```
 
 ## Technical Details
@@ -69,9 +72,11 @@ npm run asset-growth <vault-address> --json
 
 ### Asset Growth Methodology
 
-- Reads `totalAssets()` from ERC-4626 vault contract
-- Samples asset values at regular block intervals
-- Calculates APY based on growth rate over time period
+- Starts from the first deposit block (not deployment) to ensure meaningful metrics
+- Calculates share price using `totalAssets()` / `totalSupply()`
+- Tracks asset growth independent of deposits/withdrawals
+- Computes APY for periods ≥ 1 day
+- Time periods use 2-second block time estimation for Katana
 
 ## License
 

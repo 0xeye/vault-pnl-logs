@@ -120,17 +120,19 @@ function calculateGrowth(
 async function main() {
   const args = process.argv.slice(2);
   
-  const vaultAddress = args.find((_, i) => args[i - 1] === '--vault');
+  // First positional argument is the vault address
+  const vaultAddress = args.find(arg => !arg.startsWith('--'));
+  
   const fromBlockArg = args.find((_, i) => args[i - 1] === '--from-block');
   const toBlockArg = args.find((_, i) => args[i - 1] === '--to-block');
   const periodArg = args.find((_, i) => args[i - 1] === '--period');
 
   if (!vaultAddress) {
-    console.error('Error: --vault <address> is required');
+    console.error('Error: vault address is required');
     console.error('\nUsage:');
-    console.error('  bun run asset-growth --vault <address>                    # From first deposit to latest');
-    console.error('  bun run asset-growth --vault <address> --period 1m        # Last month');
-    console.error('  bun run asset-growth --vault <address> --from-block 1000  # From specific block');
+    console.error('  bun run asset-growth <address>                    # From first deposit to latest');
+    console.error('  bun run asset-growth <address> --period 1m        # Last month');
+    console.error('  bun run asset-growth <address> --from-block 1000  # From specific block');
     process.exit(1);
   }
 
@@ -176,7 +178,7 @@ async function main() {
   console.log(`Period: Block ${initialSnapshot.blockNumber} → Block ${currentSnapshot.blockNumber}`);
   
   if (periodArg) {
-    console.log(`Time Period: ${periodArg} (${daysElapsed.toFixed(1)} days)`);
+    console.log(`Time Period: ${periodArg}`);
   } else {
     const startDate = new Date(Number(initialBlock.timestamp) * 1000).toISOString().split('T')[0];
     const endDate = new Date(Number(currentBlock.timestamp) * 1000).toISOString().split('T')[0];
