@@ -120,8 +120,9 @@ function calculateGrowth(
 async function main() {
   const args = process.argv.slice(2);
   
-  // First positional argument is the vault address
-  const vaultAddress = args.find(arg => !arg.startsWith('--'));
+  // First positional argument that's not a chain name is the vault address
+  const chainNames = ['ethereum', 'optimism', 'arbitrum', 'polygon', 'base', 'katana'];
+  const vaultAddress = args.find(arg => !arg.startsWith('--') && !chainNames.includes(arg));
   
   const fromBlockArg = args.find((_, i) => args[i - 1] === '--from-block');
   const toBlockArg = args.find((_, i) => args[i - 1] === '--to-block');
@@ -130,14 +131,15 @@ async function main() {
   if (!vaultAddress) {
     console.error('Error: vault address is required');
     console.error('\nUsage:');
-    console.error('  bun run asset-growth <address>                    # From first deposit to latest');
-    console.error('  bun run asset-growth <address> --period 1m        # Last month');
-    console.error('  bun run asset-growth <address> --from-block 1000  # From specific block');
+    console.error('  bun run asset-growth [--chain <chain>] <address>                    # From first deposit to latest');
+    console.error('  bun run asset-growth [--chain <chain>] <address> --period 1m        # Last month');
+    console.error('  bun run asset-growth [--chain <chain>] <address> --from-block 1000  # From specific block');
+    console.error('\nSupported chains: ethereum, optimism, arbitrum, polygon, base, katana');
     process.exit(1);
   }
 
-  const config = loadConfig();
-  const client = createClient(config.rpcUrl);
+  const config = loadConfig(args);
+  const client = createClient(config.rpcUrl, config.chain);
 
   const vaultInfo = await fetchVaultInfo(client, vaultAddress);
   
@@ -173,6 +175,7 @@ async function main() {
   const annualizedRate = daysElapsed > 0 ? (Math.pow(1 + growth.growthRate, 365 / daysElapsed) - 1) * 100 : 0;
 
   console.log('\n=== ERC-4626 Vault Asset Growth Analysis ===\n');
+  console.log(`Chain: ${config.chainName}`);
   console.log(`Vault Address: ${vaultAddress}`);
   console.log(`Asset: ${vaultInfo.assetSymbol}`);
   console.log(`Period: Block ${initialSnapshot.blockNumber} → Block ${currentSnapshot.blockNumber}`);

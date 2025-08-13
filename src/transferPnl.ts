@@ -71,12 +71,27 @@ const fetchTransfers = async (
   console.log(`Fetching transfers for token: ${tokenAddress}`)
   const startTime = Date.now()
   
-  const logs = await client.getLogs({
-    address: tokenAddress as `0x${string}`,
-    event: parseAbiItem(TRANSFER_EVENT),
-    fromBlock: 'earliest',
-    toBlock: 'latest',
-  })
+  // Get current block number
+  const currentBlock = await client.getBlockNumber()
+  
+  // Try to fetch all logs at once first
+  let logs
+  try {
+    logs = await client.getLogs({
+      address: tokenAddress as `0x${string}`,
+      event: parseAbiItem(TRANSFER_EVENT),
+      fromBlock: 'earliest',
+      toBlock: 'latest',
+    })
+  } catch (error: any) {
+    // If we hit a block range limit, fetch in chunks
+    if (error.message?.includes('block range') || error.details?.includes('block range')) {
+      console.log('Block range limit detected, fetching in chunks...')
+      logs = await fetchTransfersInChunks(client, tokenAddress, currentBlock)
+    } else {
+      throw error
+    }
+  }
 
   console.log(`Found ${logs.length} transfers in ${Date.now() - startTime}ms`)
 
@@ -100,18 +115,108 @@ const fetchTransfers = async (
   return sorted
 }
 
+const fetchTransfersInChunks = async (
+  client: PublicClient,
+  tokenAddress: string,
+  currentBlock: bigint
+): Promise<any[]> => {
+  const CHUNK_SIZE = 40000n // Safe chunk size below common limits
+  const estimatedStartBlock = currentBlock > 10000000n ? currentBlock - 5000000n : 0n
+  const totalBlocks = currentBlock - estimatedStartBlock
+  const totalChunks = Number((totalBlocks + CHUNK_SIZE - 1n) / CHUNK_SIZE)
+  
+  console.log(`\nScanning ${totalBlocks.toLocaleString()} blocks in ${totalChunks} chunks...`)
+  console.log(`Block range: ${estimatedStartBlock.toLocaleString()} → ${currentBlock.toLocaleString()}\n`)
+  
+  const startTime = Date.now()
+  
+  // Create chunk ranges
+  const chunks = Array.from({ length: totalChunks }, (_, i) => {
+    const start = estimatedStartBlock + BigInt(i) * CHUNK_SIZE
+    const end = start + CHUNK_SIZE - 1n < currentBlock ? start + CHUNK_SIZE - 1n : currentBlock
+    return { start, end, index: i }
+  })
+  
+  // Process chunks sequentially to maintain progress display
+  const processedChunks = await chunks.reduce(
+    async (accPromise, chunk) => {
+      const { logs, totalFound, errors } = await accPromise
+      const { start, end, index } = chunk
+      
+      const progress = (((index + 1) / totalChunks) * 100).toFixed(1)
+      const elapsed = (Date.now() - startTime) / 1000
+      const rate = (index + 1) / elapsed
+      const remaining = (totalChunks - index - 1) / rate
+      const eta = remaining > 60 ? `${Math.floor(remaining / 60)}m ${Math.floor(remaining % 60)}s` : `${Math.floor(remaining)}s`
+      
+      const progressBar = '█'.repeat(Math.floor(((index + 1) / totalChunks) * 30)) + 
+                         '░'.repeat(30 - Math.floor(((index + 1) / totalChunks) * 30))
+      
+      process.stdout.write(`\r[${progressBar}] ${progress}% | Chunk ${index + 1}/${totalChunks} | Transfers: ${totalFound.toLocaleString()} | ETA: ${eta}`)
+      
+      try {
+        const chunkLogs = await client.getLogs({
+          address: tokenAddress as `0x${string}`,
+          event: parseAbiItem(TRANSFER_EVENT),
+          fromBlock: start,
+          toBlock: end,
+        })
+        
+        return {
+          logs: [...logs, ...chunkLogs],
+          totalFound: totalFound + chunkLogs.length,
+          errors,
+        }
+      } catch (error) {
+        process.stdout.write(`\r[${progressBar}] ${progress}% | Chunk ${index + 1}/${totalChunks} | Transfers: ${totalFound.toLocaleString()} | Errors: ${errors + 1}`)
+        return {
+          logs,
+          totalFound,
+          errors: errors + 1,
+        }
+      }
+    },
+    Promise.resolve({ logs: [] as any[], totalFound: 0, errors: 0 })
+  )
+  
+  const totalTime = ((Date.now() - startTime) / 1000).toFixed(1)
+  console.log(`\n✓ Scan complete in ${totalTime}s | Found ${processedChunks.totalFound.toLocaleString()} transfers${processedChunks.errors > 0 ? ` | ${processedChunks.errors} errors` : ''}\n`)
+  
+  return processedChunks.logs
+}
+
 const fetchAllPrices = async (
   client: PublicClient,
   vaultAddress: string,
   transfers: Transfer[],
   decimals: number,
   assetDecimals: number
-): Promise<Map<bigint, bigint>> => {
+): Promise<{ priceMap: Map<bigint, bigint>; currentPrice: bigint }> => {
   console.log('Fetching historical prices...')
   const startTime = Date.now()
   
-  const priceMap = new Map<bigint, bigint>()
   const bridgePrice = 10n ** BigInt(assetDecimals)
+  const erc4626Abi = parseAbi([
+    'function convertToAssets(uint256 shares) view returns (uint256)',
+  ])
+  const oneShare = 10n ** BigInt(decimals)
+  
+  // Get current price as fallback
+  let currentPrice: bigint
+  try {
+    currentPrice = await client.readContract({
+      address: vaultAddress as `0x${string}`,
+      abi: erc4626Abi,
+      functionName: 'convertToAssets',
+      args: [oneShare],
+    })
+    console.log(`Current price: ${formatUnits(currentPrice, assetDecimals)} assets per share`)
+  } catch (error) {
+    console.error('Failed to fetch current price:', error)
+    // Fallback to 1:1 ratio if current price fetch fails
+    currentPrice = oneShare
+    console.log(`Using fallback price: ${formatUnits(currentPrice, assetDecimals)} assets per share`)
+  }
   
   // Get unique blocks that need prices (excluding bridge mints)
   const uniqueBlocks = [...new Set(
@@ -122,128 +227,156 @@ const fetchAllPrices = async (
   
   console.log(`Need to fetch prices for ${uniqueBlocks.length} unique blocks`)
   
-  const erc4626Abi = parseAbi([
-    'function convertToAssets(uint256 shares) view returns (uint256)',
-  ])
-  const oneShare = 10n ** BigInt(decimals)
+  // Create batches
+  const batchSize = 100
+  const batches = Array.from(
+    { length: Math.ceil(uniqueBlocks.length / batchSize) },
+    (_, i) => uniqueBlocks.slice(i * batchSize, (i + 1) * batchSize)
+  )
   
-  // Get current price as fallback
-  const currentPrice = await client.readContract({
-    address: vaultAddress as `0x${string}`,
-    abi: erc4626Abi,
-    functionName: 'convertToAssets',
-    args: [oneShare],
-  })
-  console.log(`Current price: ${formatUnits(currentPrice, assetDecimals)} assets per share`)
+  // Process all batches and collect results
+  const batchResults = await Promise.all(
+    batches.map(async (batch, batchIndex) => {
+      const contracts = batch.map(blockNumber => ({
+        address: vaultAddress as `0x${string}`,
+        abi: erc4626Abi,
+        functionName: 'convertToAssets' as const,
+        args: [oneShare],
+        blockNumber,
+      }))
+      
+      try {
+        const results = await client.multicall({
+          contracts,
+          allowFailure: true,
+        })
+        
+        // Log progress
+        const processedSoFar = (batchIndex + 1) * batchSize
+        if (processedSoFar % 500 === 0 || processedSoFar >= uniqueBlocks.length) {
+          console.log(`Fetched historical prices for ${Math.min(processedSoFar, uniqueBlocks.length)}/${uniqueBlocks.length} blocks...`)
+        }
+        
+        return batch.map((blockNumber, index) => {
+          const result = results[index]
+          if (result.status !== 'success') {
+            console.warn(`Failed to fetch price for block ${blockNumber}: ${result.error}`)
+          }
+          return {
+            blockNumber,
+            price: result.status === 'success' 
+              ? result.result as bigint 
+              : currentPrice
+          }
+        })
+      } catch (error) {
+        console.warn(`Batch ${batchIndex + 1} failed, using current price as fallback`)
+        return batch.map(blockNumber => ({
+          blockNumber,
+          price: currentPrice
+        }))
+      }
+    })
+  )
   
-  // For simplicity and speed, use current price for all transfers
-  // This is a reasonable approximation for PnL calculation
-  uniqueBlocks.forEach(blockNumber => {
-    priceMap.set(blockNumber, currentPrice)
-  })
+  // Flatten results and create map
+  const priceEntries = batchResults
+    .flat()
+    .map(({ blockNumber, price }) => [blockNumber, price] as const)
   
-  console.log(`Using current price for all ${uniqueBlocks.length} blocks to speed up calculation`)
-  
-  // Set bridge mint prices
-  transfers
+  // Add bridge mint prices
+  const bridgeMintEntries = transfers
     .filter(t => t.type === 'bridge_mint')
-    .forEach(t => priceMap.set(t.blockNumber, bridgePrice))
+    .map(t => [t.blockNumber, bridgePrice] as const)
+  
+  const priceMap = new Map([...priceEntries, ...bridgeMintEntries])
   
   console.log(`Price fetching completed in ${Date.now() - startTime}ms`)
-  return priceMap
+  return { priceMap, currentPrice }
 }
 
 const processUserTransfers = (
   transfers: Transfer[],
-  userPnLs: Record<string, UserPnL>,
   priceMap: Map<bigint, bigint>,
-  decimals: number
-): void => {
+  decimals: number,
+  currentPrice: bigint
+): Record<string, UserPnL> => {
   console.log('Processing user transfers...')
   const startTime = Date.now()
-  let processed = 0
   
-  for (const transfer of transfers) {
-    const price = priceMap.get(transfer.blockNumber) || 10n ** BigInt(decimals)
-    transfer.pricePerShare = price
-    
-    if (++processed % 500 === 0) {
-      console.log(`Processed ${processed}/${transfers.length} transfers...`)
+  // Add prices to transfers
+  const transfersWithPrices = transfers.map((transfer, index) => {
+    // Log progress
+    if ((index + 1) % 100 === 0 || index === transfers.length - 1) {
+      const progress = (((index + 1) / transfers.length) * 100).toFixed(1)
+      const progressBar = '█'.repeat(Math.floor(((index + 1) / transfers.length) * 30)) + 
+                         '░'.repeat(30 - Math.floor(((index + 1) / transfers.length) * 30))
+      process.stdout.write(`\r[${progressBar}] ${progress}% | ${index + 1}/${transfers.length} transfers`)
     }
-
-    // Calculate cost: (transfer.value * price) / 10^decimals
-    // This gives us the asset amount for the shares transferred
+    
+    const price = priceMap.get(transfer.blockNumber) || currentPrice
     const cost = divide(multiply(transfer.value, price), 10n ** BigInt(decimals))
-
-    switch (transfer.type) {
-      case 'mint':
-        const mintUser = transfer.to as `0x${string}`
-        // Skip mints to the bridge address to avoid double counting
-        if (isAddressEqual(mintUser , BRIDGE_ADDRESS)) {
-          break
-        }
-        if (!userPnLs[mintUser]) {
-          userPnLs[mintUser] = createEmptyUserPnL(mintUser)
-        }
-        userPnLs[mintUser].totalAcquired = add(userPnLs[mintUser].totalAcquired, transfer.value)
-        userPnLs[mintUser].currentBalance = add(userPnLs[mintUser].currentBalance, transfer.value)
-        userPnLs[mintUser].totalCostBasis = add(userPnLs[mintUser].totalCostBasis, cost)
-        userPnLs[mintUser].fifoQueue.push({
-          amount: transfer.value,
+    
+    return { ...transfer, pricePerShare: price, cost }
+  })
+  
+  // Process transfers using reduce
+  const userPnLs = transfersWithPrices.reduce((acc, transfer) => {
+    const { type, from, to, value, blockNumber, cost } = transfer
+    
+    const processAcquisition = (user: string, source: Transfer['type']) => {
+      const currentUser = acc[user] || createEmptyUserPnL(user)
+      return {
+        ...currentUser,
+        totalAcquired: add(currentUser.totalAcquired, value),
+        currentBalance: add(currentUser.currentBalance, value),
+        totalCostBasis: add(currentUser.totalCostBasis, cost),
+        fifoQueue: [...currentUser.fifoQueue, {
+          amount: value,
           costBasis: cost,
-          blockNumber: transfer.blockNumber,
-          source: transfer.type,
-        })
-        break
+          blockNumber,
+          source,
+        }],
+      }
+    }
+    
+    switch (type) {
+      case 'mint':
+        // Skip mints to the bridge address to avoid double counting
+        if (isAddressEqual(to as `0x${string}`, BRIDGE_ADDRESS)) {
+          return acc
+        }
+        return { ...acc, [to]: processAcquisition(to, type) }
         
       case 'bridge_mint':
-        const bridgeMintUser = transfer.to as `0x${string}`
-        if (!userPnLs[bridgeMintUser]) {
-          userPnLs[bridgeMintUser] = createEmptyUserPnL(bridgeMintUser)
-        }
-        userPnLs[bridgeMintUser].totalAcquired = add(userPnLs[bridgeMintUser].totalAcquired, transfer.value)
-        userPnLs[bridgeMintUser].currentBalance = add(userPnLs[bridgeMintUser].currentBalance, transfer.value)
-        userPnLs[bridgeMintUser].totalCostBasis = add(userPnLs[bridgeMintUser].totalCostBasis, cost)
-        userPnLs[bridgeMintUser].fifoQueue.push({
-          amount: transfer.value,
-          costBasis: cost,
-          blockNumber: transfer.blockNumber,
-          source: transfer.type,
-        })
-        break
-
+        return { ...acc, [to]: processAcquisition(to, type) }
+        
       case 'burn':
-        const burnUser = transfer.from as `0x${string}`
-        if (userPnLs[burnUser]) {
-          processDisposal(userPnLs[burnUser], transfer.value, cost)
-        }
-        break
-
+        if (!acc[from]) return acc
+        const burnedUser = processDisposal(acc[from], value, cost)
+        return { ...acc, [from]: burnedUser }
+        
       case 'transfer':
-        const fromUser = transfer.from as `0x${string}`
-        const toUser = transfer.to as `0x${string}`
+        let result = acc
         
-        if (userPnLs[fromUser]) {
-          processDisposal(userPnLs[fromUser], transfer.value, cost)
+        // Process disposal from sender
+        if (result[from]) {
+          const disposedUser = processDisposal(result[from], value, cost)
+          result = { ...result, [from]: disposedUser }
         }
         
-        if (!userPnLs[toUser]) {
-          userPnLs[toUser] = createEmptyUserPnL(toUser)
-        }
-        userPnLs[toUser].totalAcquired = add(userPnLs[toUser].totalAcquired, transfer.value)
-        userPnLs[toUser].currentBalance = add(userPnLs[toUser].currentBalance, transfer.value)
-        userPnLs[toUser].totalCostBasis = add(userPnLs[toUser].totalCostBasis, cost)
-        userPnLs[toUser].fifoQueue.push({
-          amount: transfer.value,
-          costBasis: cost,
-          blockNumber: transfer.blockNumber,
-          source: 'transfer',
-        })
-        break
+        // Process acquisition by receiver
+        result = { ...result, [to]: processAcquisition(to, 'transfer') }
+        
+        return result
+        
+      default:
+        return acc
     }
-  }
+  }, {} as Record<string, UserPnL>)
   
-  console.log(`Transfer processing completed in ${Date.now() - startTime}ms`)
+  console.log(`\n✓ Transfer processing completed in ${Date.now() - startTime}ms`)
+  return userPnLs
 }
 
 const createEmptyUserPnL = (user: string): UserPnL => ({
@@ -262,42 +395,57 @@ const createEmptyUserPnL = (user: string): UserPnL => ({
   fifoQueue: [],
 })
 
-const processDisposal = (userPnL: UserPnL, amount: bigint, proceeds: bigint): void => {
-  userPnL.totalDisposed = add(userPnL.totalDisposed, amount)
-  userPnL.currentBalance = subtract(userPnL.currentBalance, amount)
+const processDisposal = (userPnL: UserPnL, amount: bigint, proceeds: bigint): UserPnL => {
+  // Don't process disposal if user doesn't have enough balance
+  const disposalAmount = userPnL.currentBalance < amount ? userPnL.currentBalance : amount
+  if (disposalAmount === ZERO) return userPnL
   
-  let remainingAmount = amount
-  let costBasisForDisposal = ZERO
-  const newQueue: FIFOEntry[] = []
+  // Process FIFO queue
+  const processedQueue = userPnL.fifoQueue.reduce(
+    (acc, entry) => {
+      if (acc.remainingAmount === ZERO) {
+        return { ...acc, newQueue: [...acc.newQueue, entry] }
+      }
 
-  for (const entry of userPnL.fifoQueue) {
-    if (remainingAmount === ZERO) {
-      newQueue.push(entry)
-      continue
+      if (entry.amount <= acc.remainingAmount) {
+        return {
+          remainingAmount: subtract(acc.remainingAmount, entry.amount),
+          costBasisForDisposal: add(acc.costBasisForDisposal, entry.costBasis),
+          newQueue: acc.newQueue,
+        }
+      } else {
+        // Calculate the proportion of this entry being used
+        const costUsed = divide(multiply(entry.costBasis, acc.remainingAmount), entry.amount)
+        
+        return {
+          remainingAmount: ZERO,
+          costBasisForDisposal: add(acc.costBasisForDisposal, costUsed),
+          newQueue: [...acc.newQueue, {
+            amount: subtract(entry.amount, acc.remainingAmount),
+            costBasis: subtract(entry.costBasis, costUsed),
+            blockNumber: entry.blockNumber,
+            source: entry.source,
+          }],
+        }
+      }
+    },
+    {
+      remainingAmount: disposalAmount,
+      costBasisForDisposal: ZERO,
+      newQueue: [] as FIFOEntry[],
     }
+  )
 
-    if (entry.amount <= remainingAmount) {
-      remainingAmount = subtract(remainingAmount, entry.amount)
-      costBasisForDisposal = add(costBasisForDisposal, entry.costBasis)
-    } else {
-      // Calculate the proportion of this entry being used
-      const costUsed = divide(multiply(entry.costBasis, remainingAmount), entry.amount)
-      costBasisForDisposal = add(costBasisForDisposal, costUsed)
-      
-      newQueue.push({
-        amount: subtract(entry.amount, remainingAmount),
-        costBasis: subtract(entry.costBasis, costUsed),
-        blockNumber: entry.blockNumber,
-        source: entry.source,
-      })
-      remainingAmount = ZERO
-    }
+  const realizedGain = subtract(proceeds, processedQueue.costBasisForDisposal)
+  
+  return {
+    ...userPnL,
+    totalDisposed: add(userPnL.totalDisposed, disposalAmount),
+    currentBalance: subtract(userPnL.currentBalance, disposalAmount),
+    fifoQueue: processedQueue.newQueue,
+    realizedCostBasis: add(userPnL.realizedCostBasis, processedQueue.costBasisForDisposal),
+    realizedPnL: add(userPnL.realizedPnL, realizedGain),
   }
-
-  userPnL.fifoQueue = newQueue
-  userPnL.realizedCostBasis = add(userPnL.realizedCostBasis, costBasisForDisposal)
-  const realizedGain = subtract(proceeds, costBasisForDisposal)
-  userPnL.realizedPnL = add(userPnL.realizedPnL, realizedGain)
 }
 
 const calculateUnrealizedPnL = async (
@@ -307,7 +455,7 @@ const calculateUnrealizedPnL = async (
   decimals: number,
   assetDecimals: number
 ): Promise<void> => {
-  console.log('Calculating unrealized PnL...')
+  console.log('\nCalculating unrealized PnL...')
   const startTime = Date.now()
   
   const erc4626Abi = parseAbi([
@@ -324,7 +472,15 @@ const calculateUnrealizedPnL = async (
   
   console.log(`Current price: ${formatUnits(currentPrice, assetDecimals)} assets per share`)
 
-  for (const userPnL of Object.values(userPnLs)) {
+  const users = Object.values(userPnLs)
+  let processed = 0
+
+  for (const userPnL of users) {
+    processed++
+    if (processed % 100 === 0 || processed === users.length) {
+      const progress = ((processed / users.length) * 100).toFixed(1)
+      process.stdout.write(`\rCalculating PnL for ${processed}/${users.length} users (${progress}%)`)
+    }
     userPnL.unrealizedCostBasis = userPnL.fifoQueue.reduce(
       (sum, entry) => add(sum, entry.costBasis),
       ZERO
@@ -341,40 +497,43 @@ const calculateUnrealizedPnL = async (
     }
   }
   
-  console.log(`Unrealized PnL calculation completed in ${Date.now() - startTime}ms`)
+  console.log(`\n✓ PnL calculation completed in ${Date.now() - startTime}ms`)
 }
 
 const calculateVaultPnL = (
   transfers: Transfer[],
   userPnLs: Record<string, UserPnL>
 ): VaultPnL => {
-  let totalMinted = ZERO
-  let totalBurned = ZERO
-  let totalBridgeMinted = ZERO
+  // Calculate transfer totals
+  const transferTotals = transfers.reduce(
+    (acc, transfer) => {
+      switch (transfer.type) {
+        case 'mint':
+          // Don't count mints to the bridge address
+          return !isAddressEqual(transfer.to as `0x${string}`, BRIDGE_ADDRESS)
+            ? { ...acc, totalMinted: add(acc.totalMinted, transfer.value) }
+            : acc
+        case 'burn':
+          return { ...acc, totalBurned: add(acc.totalBurned, transfer.value) }
+        case 'bridge_mint':
+          return { ...acc, totalBridgeMinted: add(acc.totalBridgeMinted, transfer.value) }
+        default:
+          return acc
+      }
+    },
+    { totalMinted: ZERO, totalBurned: ZERO, totalBridgeMinted: ZERO }
+  )
 
-  for (const transfer of transfers) {
-    switch (transfer.type) {
-      case 'mint':
-        // Don't count mints to the bridge address
-        if (!isAddressEqual(transfer.to as `0x${string}`, BRIDGE_ADDRESS)) {
-          totalMinted = add(totalMinted, transfer.value)
-        }
-        break
-      case 'burn':
-        totalBurned = add(totalBurned, transfer.value)
-        break
-      case 'bridge_mint':
-        totalBridgeMinted = add(totalBridgeMinted, transfer.value)
-        break
-    }
-  }
-
+  const { totalMinted, totalBurned, totalBridgeMinted } = transferTotals
   const totalSupply = subtract(add(totalMinted, totalBridgeMinted), totalBurned)
-  const currentTotalValue = Object.values(userPnLs).reduce(
+  
+  // Calculate user statistics
+  const users = Object.values(userPnLs)
+  const currentTotalValue = users.reduce(
     (sum, user) => add(sum, user.currentValue),
     ZERO
   )
-  const activeUsers = Object.values(userPnLs).filter(u => u.currentBalance > ZERO).length
+  const activeUsers = users.filter(u => u.currentBalance > ZERO).length
 
   return {
     totalSupply,
@@ -383,7 +542,7 @@ const calculateVaultPnL = (
     totalBridgeMinted,
     netSupplyChange: totalSupply,
     currentTotalValue,
-    totalUsers: Object.keys(userPnLs).length,
+    totalUsers: users.length,
     activeUsers,
   }
 }
@@ -405,18 +564,25 @@ const formatUserPnL = (userPnL: UserPnL, decimals: number, assetDecimals: number
 }
 
 const main = async () => {
-  const config = loadConfig()
-  const client = createClient(config.rpcUrl)
+  const args = process.argv.slice(2)
+  const config = loadConfig(args)
+  const client = createClient(config.rpcUrl, config.chain)
 
-  const tokenAddress = process.argv[2]
+  // Find token address (first non-flag argument)
+  const tokenAddress = args.find(arg => !arg.startsWith('--') && arg !== config.chainName)
   if (!tokenAddress) {
-    console.error('Usage: npm run transfer-pnl <token-address>')
-    console.error('Example: npm run transfer-pnl 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37')
+    console.error('Usage: npm run transfer-pnl [--chain <chain>] <token-address> [--json]')
+    console.error('\nSupported chains: ethereum, optimism, arbitrum, polygon, base, katana')
+    console.error('\nExamples:')
+    console.error('  npm run transfer-pnl 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37')
+    console.error('  npm run transfer-pnl --chain ethereum 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48')
+    console.error('  npm run transfer-pnl --chain arbitrum 0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8 --json')
     process.exit(1)
   }
 
   try {
     console.log('\n=== STARTING TRANSFER PNL ANALYSIS ===')
+    console.log(`Chain: ${config.chainName}`)
     const totalStartTime = Date.now()
     
     console.log('\nFetching vault info...')
@@ -426,7 +592,7 @@ const main = async () => {
     const transfers = await fetchTransfers(client, tokenAddress)
     
     // Fetch all prices upfront using multicall
-    const priceMap = await fetchAllPrices(
+    const { priceMap, currentPrice } = await fetchAllPrices(
       client,
       tokenAddress,
       transfers,
@@ -434,13 +600,11 @@ const main = async () => {
       vaultInfo.assetDecimals
     )
     
-    const userPnLs: Record<string, UserPnL> = {}
-    
-    processUserTransfers(
+    const userPnLs = processUserTransfers(
       transfers,
-      userPnLs,
       priceMap,
-      vaultInfo.decimals
+      vaultInfo.decimals,
+      currentPrice
     )
     
     await calculateUnrealizedPnL(
@@ -456,6 +620,7 @@ const main = async () => {
     console.log(`\nTotal analysis time: ${Date.now() - totalStartTime}ms`)
 
     console.log('\n=== VAULT TOKEN PNL ANALYSIS ===')
+    console.log(`Chain: ${config.chainName}`)
     console.log(`Token: ${tokenAddress}`)
     console.log(`Asset: ${vaultInfo.assetSymbol}`)
     console.log('\n--- Vault Statistics ---')

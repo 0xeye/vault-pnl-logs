@@ -12,16 +12,29 @@ This toolkit provides two main analytics scripts:
 
 ## Configuration
 
-### Environment Variables (Optional)
+### Environment Variables
 
-Create a `.env` file to override default RPC URLs:
+Create a `.env` file to configure RPC URLs:
 
 ```env
-KATANA_RPC_URL=https://your-katana-rpc  # Required for Katana
+# Required for Katana
+KATANA_RPC_URL=https://your-katana-rpc
+
+# Optional - override default public RPC URLs
+ETHEREUM_RPC_URL=https://your-ethereum-rpc
+OPTIMISM_RPC_URL=https://your-optimism-rpc
+ARBITRUM_RPC_URL=https://your-arbitrum-rpc
+POLYGON_RPC_URL=https://your-polygon-rpc
+BASE_RPC_URL=https://your-base-rpc
 ```
 
 ### Supported Chains
 
+- **ethereum** - Ethereum Mainnet (default RPC: publicnode.com)
+- **optimism** - Optimism L2 (default RPC: publicnode.com)
+- **arbitrum** - Arbitrum One (default RPC: publicnode.com)
+- **polygon** - Polygon PoS (default RPC: publicnode.com)
+- **base** - Base L2 (default RPC: publicnode.com)
 - **katana** - Katana (requires KATANA_RPC_URL env var)
 
 ## Usage
@@ -31,10 +44,19 @@ KATANA_RPC_URL=https://your-katana-rpc  # Required for Katana
 Calculate PnL for all token holders based on transfer history:
 
 ```bash
+# Default chain (katana)
 npm run transfer-pnl <token-address>
 
-# Example
+# Specify chain
+npm run transfer-pnl --chain <chain-name> <token-address>
+
+# Examples
 npm run transfer-pnl 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37
+npm run transfer-pnl --chain ethereum 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48  # USDC on Ethereum
+npm run transfer-pnl --chain arbitrum 0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8  # USDC on Arbitrum
+npm run transfer-pnl --chain optimism 0x7F5c764cBc14f9669B88837ca1490cCa17c31607  # USDC on Optimism
+npm run transfer-pnl --chain polygon 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174   # USDC on Polygon
+npm run transfer-pnl --chain base 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913     # USDC on Base
 ```
 
 ### Asset Growth Tracking
@@ -42,14 +64,22 @@ npm run transfer-pnl 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37
 Monitor vault asset growth and calculate APY:
 
 ```bash
-# From first deposit to latest block
-npm run asset-growth <address>
+# Default chain (katana)
+npm run asset-growth <vault-address>
+
+# Specify chain
+npm run asset-growth --chain <chain-name> <vault-address>
 
 # Analyze specific time periods
-npm run asset-growth <address> --period <1m | 1w | 1d | 1y>
+npm run asset-growth --chain <chain-name> <vault-address> --period <1m | 1w | 1d | 1y>
 
 # Analyze specific block range
-npm run asset-growth <address> --from-block 1000 --to-block 2000
+npm run asset-growth --chain <chain-name> <vault-address> --from-block 1000 --to-block 2000
+
+# Examples
+npm run asset-growth 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37
+npm run asset-growth --chain ethereum 0x83F20F44975D03b1b09e64809B757c47f942BEeA  # sDAI on Ethereum
+npm run asset-growth --chain arbitrum 0x5979D7b546E38E414F7E9822514be443A4800529  # wstETH on Arbitrum
 ```
 
 ### JSON Export
@@ -57,7 +87,11 @@ npm run asset-growth <address> --from-block 1000 --to-block 2000
 Transfer PnL script supports JSON export for programmatic use:
 
 ```bash
-npm run transfer-pnl <token-address> --json
+npm run transfer-pnl [--chain <chain-name>] <token-address> --json
+
+# Examples
+npm run transfer-pnl --json 0xE007CA01894c863d7898045ed5A3B4Abf0b18f37
+npm run transfer-pnl --chain ethereum --json 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
 ```
 
 ## Technical Details

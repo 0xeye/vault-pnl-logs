@@ -1,9 +1,8 @@
-import { createPublicClient, http, type PublicClient } from 'viem';
-import { katanaChain } from '../chain';
+import { createPublicClient, http, type PublicClient, type Chain } from 'viem';
 
-export const createClient = (rpcUrl: string): PublicClient => {
+export const createClient = (rpcUrl: string, chain: Chain): PublicClient => {
   return createPublicClient({
-    chain: katanaChain,
+    chain,
     transport: http(rpcUrl),
   });
 };
