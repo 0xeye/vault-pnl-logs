@@ -227,57 +227,83 @@ const fetchAllPrices = async (
   
   console.log(`Need to fetch prices for ${uniqueBlocks.length} unique blocks`)
   
-  // Create batches
-  const batchSize = 100
+  // Create batches - balanced size for individual queries
+  const batchSize = 20 // Balance between parallelism and RPC load
   const batches = Array.from(
     { length: Math.ceil(uniqueBlocks.length / batchSize) },
     (_, i) => uniqueBlocks.slice(i * batchSize, (i + 1) * batchSize)
   )
   
-  // Process all batches and collect results
-  const batchResults = await Promise.all(
-    batches.map(async (batch, batchIndex) => {
-      const contracts = batch.map(blockNumber => ({
-        address: vaultAddress as `0x${string}`,
-        abi: erc4626Abi,
-        functionName: 'convertToAssets' as const,
-        args: [oneShare],
-        blockNumber,
-      }))
+  // Process batches sequentially with individual calls for proper historical data
+  const batchResults: Array<{ blockNumber: bigint; price: bigint }[]> = []
+  const priceCache = new Map<bigint, bigint>() // Cache to avoid duplicate queries
+  
+  for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+    const batch = batches[batchIndex]
+    const batchStartTime = Date.now()
+    
+    try {
+      // Process each block individually to get proper historical prices
+      const batchPrices = await Promise.all(
+        batch.map(async (blockNumber) => {
+          // Check cache first
+          const cachedPrice = priceCache.get(blockNumber)
+          if (cachedPrice !== undefined) {
+            return { blockNumber, price: cachedPrice }
+          }
+          
+          try {
+            const price = await client.readContract({
+              address: vaultAddress as `0x${string}`,
+              abi: erc4626Abi,
+              functionName: 'convertToAssets',
+              args: [oneShare],
+              blockNumber, // This properly queries historical state
+            })
+            priceCache.set(blockNumber, price) // Cache the result
+            return { blockNumber, price }
+          } catch (error) {
+            // If historical query fails, try without block number
+            try {
+              const price = await client.readContract({
+                address: vaultAddress as `0x${string}`,
+                abi: erc4626Abi,
+                functionName: 'convertToAssets',
+                args: [oneShare],
+              })
+              console.warn(`Historical query failed for block ${blockNumber}, using current price`)
+              return { blockNumber, price }
+            } catch {
+              console.warn(`Failed to fetch price for block ${blockNumber}, using fallback`)
+              return { blockNumber, price: currentPrice }
+            }
+          }
+        })
+      )
       
-      try {
-        const results = await client.multicall({
-          contracts,
-          allowFailure: true,
-        })
-        
-        // Log progress
-        const processedSoFar = (batchIndex + 1) * batchSize
-        if (processedSoFar % 500 === 0 || processedSoFar >= uniqueBlocks.length) {
-          console.log(`Fetched historical prices for ${Math.min(processedSoFar, uniqueBlocks.length)}/${uniqueBlocks.length} blocks...`)
-        }
-        
-        return batch.map((blockNumber, index) => {
-          const result = results[index]
-          if (result.status !== 'success') {
-            console.warn(`Failed to fetch price for block ${blockNumber}: ${result.error}`)
-          }
-          return {
-            blockNumber,
-            price: result.status === 'success' 
-              ? result.result as bigint 
-              : currentPrice
-          }
-        })
-      } catch (error) {
-        console.warn(`Batch ${batchIndex + 1} failed, using current price as fallback`)
-        return batch.map(blockNumber => ({
-          blockNumber,
-          price: currentPrice
-        }))
+      batchResults.push(batchPrices)
+      
+      // Log progress and sample prices
+      const processedSoFar = (batchIndex + 1) * batchSize
+      if (batchIndex === 0) {
+        const samplePrices = batchPrices.slice(0, 5).map(p => formatUnits(p.price, assetDecimals))
+        console.log(`Sample historical prices: ${samplePrices.join(', ')} assets per share`)
       }
-    })
-  )
+      
+      if (processedSoFar % 50 === 0 || processedSoFar >= uniqueBlocks.length) {
+        const elapsed = (Date.now() - startTime) / 1000
+        const rate = processedSoFar / elapsed
+        console.log(`Fetched historical prices for ${Math.min(processedSoFar, uniqueBlocks.length)}/${uniqueBlocks.length} blocks (${elapsed.toFixed(1)}s, ${rate.toFixed(1)} blocks/s)...`)
+      }
+      
+    } catch (error) {
+      console.warn(`Batch ${batchIndex + 1} failed entirely, using current price as fallback`)
+      batchResults.push(batch.map(blockNumber => ({
+        blockNumber,
+        price: currentPrice
+      })))
+    }
+  }
   
   // Flatten results and create map
   const priceEntries = batchResults
@@ -490,6 +516,7 @@ const calculateUnrealizedPnL = async (
     userPnL.currentValue = divide(multiply(userPnL.currentBalance, currentPrice), 10n ** BigInt(decimals))
     userPnL.unrealizedPnL = subtract(userPnL.currentValue, userPnL.unrealizedCostBasis)
     userPnL.totalPnL = add(userPnL.realizedPnL, userPnL.unrealizedPnL)
+    
     
     if (userPnL.totalAcquired > ZERO) {
       userPnL.avgAcquisitionPrice = exactToSimple(userPnL.totalCostBasis, assetDecimals) / 
